@@ -20,7 +20,16 @@ export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
 cargo run --release
 ```
 
-Config: `~/Library/Application Support/app.NoteSync.note-sync/config.json` (via `directories` crate).
+### macOS `.app`
+
+```bash
+./scripts/package_app.sh
+open "$HOME/Applications/Note Sync.app"
+```
+
+打包會用 `assets/icon/`（Codex 設計）產生 `.icns`，輸出到 `dist/Note Sync.app`，並可複製到 `~/Applications`。
+
+Config: `~/Library/Application Support/app.NoteSync.note-sync/config.json`（via `directories` crate）。
 
 ## Tests
 

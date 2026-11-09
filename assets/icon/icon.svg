@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="note-sync-icon-title note-sync-icon-desc">
+  <title id="note-sync-icon-title">note-sync</title>
+  <desc id="note-sync-icon-desc">A cool white folded note surrounded by two mint synchronization arrows on a deep navy rounded square. The outer canvas is transparent.</desc>
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="#102A38"/>
+  <path d="M 224 464 C 224 305 353 176 512 176 C 671 176 800 305 800 464" fill="none" stroke="#40D6B0" stroke-width="44" stroke-linecap="round"/>
+  <path d="M 748 412 L 800 464 L 852 412" fill="none" stroke="#40D6B0" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 800 560 C 800 719 671 848 512 848 C 353 848 224 719 224 560" fill="none" stroke="#40D6B0" stroke-width="44" stroke-linecap="round"/>
+  <path d="M 172 612 L 224 560 L 276 612" fill="none" stroke="#40D6B0" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 372 272 L 560 272 L 692 404 L 692 712 Q 692 752 652 752 L 372 752 Q 332 752 332 712 L 332 312 Q 332 272 372 272 Z" fill="#EDF6F8"/>
+  <path d="M 560 272 L 692 404 L 592 404 Q 560 404 560 372 Z" fill="#ACC9D4"/>
+  <path d="M 404 484 L 620 484 M 404 564 L 552 564" fill="none" stroke="#102A38" stroke-width="28" stroke-linecap="round"/>
+</svg>
