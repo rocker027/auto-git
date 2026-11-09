@@ -22,7 +22,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
-            .with_title("note-sync"),
+            .with_min_inner_size([720.0, 480.0])
+            .with_title("Note Sync"),
         ..Default::default()
     };
 
@@ -32,53 +33,65 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let icon = make_icon();
             let menu = Menu::new();
-            let _show = MenuItem::new("Show Window", true, None);
-            let _quit = MenuItem::new("Quit", true, None);
-            let _ = menu.append(&_show);
+            let show_item = MenuItem::new("顯示視窗", true, None);
+            let quit_item = MenuItem::new("結束", true, None);
+            let _ = menu.append(&show_item);
             let _ = menu.append(&PredefinedMenuItem::separator());
-            let _ = menu.append(&_quit);
+            let _ = menu.append(&quit_item);
 
             let tray = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
-                .with_tooltip("note-sync")
+                .with_tooltip("Note Sync")
                 .with_icon(icon)
+                .with_icon_as_template(true)
                 .build()
                 .ok();
             *tray_c.borrow_mut() = tray;
 
-            // Keep menu item IDs alive by leaking intentionally for MVP.
-            // (MenuItems must outlive the tray menu on some platforms.)
-            std::mem::forget(_show);
-            std::mem::forget(_quit);
-
+            install_cjk_fallback(&cc.egui_ctx);
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
             let app = NoteSyncApp::new(
                 config,
                 dirty_editor,
                 scheduler,
                 tray_c.borrow_mut().take(),
+                show_item,
+                quit_item,
             );
-            // Prefer dark-ish for long reading; egui defaults are fine.
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
             Ok(Box::new(app))
         }),
     )
 }
 
+fn install_cjk_fallback(ctx: &egui::Context) {
+    let Some(bytes) = note_sync::app_ui::cjk_font_bytes() else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "cjk".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(list) = fonts.families.get_mut(&family) {
+            list.push("cjk".to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
 fn make_icon() -> Icon {
-    // 32x32 solid glyph — avoids shipping a PNG for MVP.
     let size = 32u32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let i = ((y * size + x) * 4) as usize;
-            let on = x > 6 && x < 26 && y > 6 && y < 26;
-            if on {
-                rgba[i] = 90;
-                rgba[i + 1] = 180;
-                rgba[i + 2] = 120;
-                rgba[i + 3] = 255;
+    let mut pixels = vec![0u8; (size * size * 4) as usize];
+    for row in 0..size {
+        for column in 0..size {
+            let edge = column == 9 || column == 22 || row == 7 || row == 25;
+            let inside = (9..=22).contains(&column) && (7..=25).contains(&row);
+            if inside && edge {
+                let index = ((row * size + column) * 4) as usize;
+                pixels[index + 3] = 255;
             }
         }
     }
-    Icon::from_rgba(rgba, size, size).expect("icon")
+    Icon::from_rgba(pixels, size, size).expect("icon")
 }

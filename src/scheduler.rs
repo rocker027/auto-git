@@ -20,10 +20,7 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn start(
-        config: Arc<Mutex<AppConfig>>,
-        dirty_editor: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn start(config: Arc<Mutex<AppConfig>>, dirty_editor: Arc<AtomicBool>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(SchedulerStatus::default()));

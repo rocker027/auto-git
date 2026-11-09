@@ -53,8 +53,8 @@ impl AppConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("read config {}", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("read config {}", path.display()))?;
         let cfg: Self = serde_json::from_str(&raw).context("parse config.json")?;
         Ok(cfg)
     }
@@ -75,6 +75,10 @@ impl AppConfig {
             self.folders.push(folder);
         }
     }
+
+    pub fn remove_folder(&mut self, folder: &Path) {
+        self.folders.retain(|existing| existing != folder);
+    }
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -84,6 +88,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -100,5 +105,18 @@ mod tests {
         cfg.add_folder(dir.path().to_path_buf());
         cfg.add_folder(dir.path().to_path_buf());
         assert_eq!(cfg.folders.len(), 1);
+    }
+
+    #[test]
+    fn remove_folder_drops_the_chosen_path() {
+        let kept = tempdir().unwrap();
+        let dropped = tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.add_folder(kept.path().to_path_buf());
+        cfg.add_folder(dropped.path().to_path_buf());
+        let dropped_stored = cfg.folders[1].clone();
+        cfg.remove_folder(&dropped_stored);
+        assert_eq!(cfg.folders.len(), 1);
+        assert_eq!(cfg.folders[0], fs::canonicalize(kept.path()).unwrap());
     }
 }

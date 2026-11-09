@@ -105,11 +105,7 @@ fn count_paths(lines: &[String]) -> usize {
         .sum()
 }
 
-pub fn auto_commit(
-    git: &Path,
-    repo: &Path,
-    skip_if_staged: bool,
-) -> Result<CommitOutcome> {
+pub fn auto_commit(git: &Path, repo: &Path, skip_if_staged: bool) -> Result<CommitOutcome> {
     ensure_git_repo(git, repo)?;
 
     if let Some(busy) = is_busy_state(git, repo)? {
@@ -164,7 +160,12 @@ mod tests {
     }
 
     fn configure_identity(repo: &Path) {
-        run_git(git_bin(), repo, &["config", "user.email", "test@example.com"]).unwrap();
+        run_git(
+            git_bin(),
+            repo,
+            &["config", "user.email", "test@example.com"],
+        )
+        .unwrap();
         run_git(git_bin(), repo, &["config", "user.name", "Test"]).unwrap();
     }
 
