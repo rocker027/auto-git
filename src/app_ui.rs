@@ -196,7 +196,7 @@ impl NoteSyncApp {
     }
 
     /// Saves unsaved text before switching away or closing.
-    /// False only when the text could not be written (conflict or write error).
+    /// False only when the text was not written (conflict, unreadable file, or write error).
     fn save_before_leaving(&mut self) -> bool {
         let Some(editor) = self.editor.as_mut() else {
             return true;
@@ -595,6 +595,8 @@ impl NoteSyncApp {
         let can_retry = !editor.has_conflict && !editor.is_unreadable;
         let reason = if editor.has_conflict {
             "這則筆記在別的地方被改過了。".to_string()
+        } else if editor.is_unreadable {
+            format!("{}\n要存回原位置，請按取消後按 ⌘S。", editor.error)
         } else {
             editor.error.clone()
         };
