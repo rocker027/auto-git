@@ -2,6 +2,8 @@
 
 Lightweight macOS menu-bar tool for Markdown note folders:
 
+- Closing the window (red button) keeps the app running in the menu bar and backing up; 「顯示視窗」 in the menu bar icon or the Dock icon brings it back. ⌘Q or 「結束」 quits
+
 - Watch multiple folders and periodically `git add` + `git commit` (`update N files`)
 - `git init` when a folder is not a repo
 - Left: 「＋ 加入資料夾」 above the list, then every Markdown note grouped by folder, newest first. Click a folder title to fold or unfold it; searching shows matches in every folder. The search box filters by name and text as you type

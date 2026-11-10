@@ -10,3 +10,4 @@ pub mod qmd_ops;
 pub mod scheduler;
 pub mod status;
 pub mod widgets;
+pub mod window_life;

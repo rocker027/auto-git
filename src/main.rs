@@ -52,11 +52,19 @@ fn main() -> eframe::Result {
             install_cjk_fallback(&cc.egui_ctx);
             note_sync::widgets::apply_style(&cc.egui_ctx);
             let (app_menu, app_quit) = make_app_menu();
+            let quitting = Arc::new(AtomicBool::new(false));
+            note_sync::window_life::install_menu_handler(
+                cc.egui_ctx.clone(),
+                show_item.id().clone(),
+                vec![quit_item.id().clone(), app_quit.id().clone()],
+                quitting.clone(),
+            );
             let menus = SystemMenus {
                 tray: tray_c.borrow_mut().take(),
                 show_item,
                 quit_items: vec![quit_item, app_quit],
                 app_menu,
+                quitting,
             };
             let app = NoteSyncApp::new(config, dirty_editor, scheduler, menus);
             Ok(Box::new(app))

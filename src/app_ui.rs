@@ -13,6 +13,7 @@ use crate::editor_view::{
     show_text_editor,
 };
 use crate::widgets;
+use crate::window_life::{self, CloseAction};
 use eframe::egui::{self, Id, RichText};
 use std::collections::HashSet;
 use std::fs;
@@ -32,7 +33,10 @@ const SEARCH_ID: &str = "note-search";
 /// Something waiting on the "save first?" question.
 enum Pending {
     Open(PathBuf),
+    /// Quit the app after the question.
     Close,
+    /// Hide the window into the menu bar after the question.
+    Hide,
 }
 
 enum Choice {
@@ -75,6 +79,8 @@ pub struct SystemMenus {
     /// Tray "結束" and the app menu's ⌘Q item; both go through the unsaved-text check.
     pub quit_items: Vec<tray_icon::menu::MenuItem>,
     pub app_menu: Option<tray_icon::menu::Menu>,
+    /// Set by the menu handler when Quit was chosen, so the close request ends the app.
+    pub quitting: Arc<AtomicBool>,
 }
 
 impl NoteSyncApp {
@@ -272,28 +278,29 @@ impl NoteSyncApp {
                 self.may_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+            Pending::Hide => window_life::hide_app(ctx),
         }
     }
 
     // ---- window events ------------------------------------------------------
 
-    fn handle_tray(&self, ctx: &egui::Context) {
-        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-            if event.id == *self.menus.show_item.id() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else if self.menus.quit_items.iter().any(|item| item.id() == &event.id) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-    }
-
-    /// Unsaved text must never vanish with the window.
+    /// The close button hides the window; Quit ends the app.
+    /// Either way unsaved text is saved first, or the user is asked.
     fn guard_close(&mut self, ctx: &egui::Context) {
-        let asked = ctx.input(|input| input.viewport().close_requested());
-        if asked && !self.may_close && !self.save_before_leaving() {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        let is_quitting = self.menus.quitting.swap(false, Ordering::SeqCst);
+        let may_close = self.may_close;
+        let action = window_life::on_close_request(is_quitting, may_close, || self.save_before_leaving());
+        if action != CloseAction::Allow {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending = Some(Pending::Close);
+        }
+        match action {
+            CloseAction::Allow => {}
+            CloseAction::Hide => window_life::hide_app(ctx),
+            CloseAction::AskThenHide => self.pending = Some(Pending::Hide),
+            CloseAction::AskThenQuit => self.pending = Some(Pending::Close),
         }
     }
 
@@ -679,7 +686,6 @@ impl NoteSyncApp {
 
 impl eframe::App for NoteSyncApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.handle_tray(ctx);
         self.guard_close(ctx);
         self.handle_shortcuts(ctx);
         self.refresh_editor();
