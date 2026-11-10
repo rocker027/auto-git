@@ -127,11 +127,6 @@ impl NoteSyncApp {
     }
 
     fn open_hit(&mut self, path: PathBuf) {
-        let roots = self.config.lock().unwrap().folders.clone();
-        if !roots.is_empty() && !qmd_ops::path_allowed(&path, &roots) {
-            self.editor_notice = "這篇不在已加入的資料夾裡".into();
-            return;
-        }
         match fs::read_to_string(&path) {
             Ok(text) => {
                 self.disk_fingerprint = fingerprint(&text);
@@ -305,8 +300,14 @@ impl NoteSyncApp {
         let mut chosen = None;
         for hit in &hits {
             let selected = self.open_path.as_ref() == Some(&hit.file);
+            let width = ui.available_width();
             if ui
-                .selectable_label(selected, hit_label(hit, &hits))
+                .add(
+                    egui::Button::new(hit_label(hit, &hits))
+                        .truncate()
+                        .selected(selected)
+                        .min_size(egui::vec2(width, 28.0)),
+                )
                 .clicked()
             {
                 chosen = Some(hit.file.clone());
@@ -445,13 +446,15 @@ impl eframe::App for NoteSyncApp {
             .default_width(280.0)
             .show(ctx, |ui| {
                 self.show_search(ui);
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.show_hits(ui);
-                    if self.searched {
-                        ui.separator();
-                    }
-                    self.show_folders(ui);
-                });
+                if self.searched {
+                    egui::ScrollArea::vertical()
+                        .max_height((ui.available_height() - 120.0).max(80.0))
+                        .show(ui, |ui| {
+                            self.show_hits(ui);
+                        });
+                    ui.separator();
+                }
+                self.show_folders(ui);
                 ui.separator();
                 self.show_backup(ui);
             });
@@ -541,21 +544,25 @@ fn hit_label(hit: &SearchHit, hits: &[SearchHit]) -> String {
     let title = hit
         .title
         .as_deref()
-        .map(str::trim)
+        .map(single_line)
         .filter(|title| !title.is_empty());
     let Some(title) = title else {
         return name;
     };
     let shared = hits
         .iter()
-        .filter(|other| other.title.as_deref().map(str::trim) == Some(title))
+        .filter(|other| other.title.as_deref().map(single_line).as_deref() == Some(title.as_str()))
         .count()
         > 1;
     if shared {
         format!("{title} · {name}")
     } else {
-        title.to_string()
+        title
     }
+}
+
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn file_name(path: &Path) -> String {
@@ -640,6 +647,11 @@ mod tests {
         assert_eq!(hit_label(&daily, &[daily.clone(), same]), "日記 · daily.md");
         let untitled = sample_hit("/notes/loose.md", None);
         assert_eq!(hit_label(&untitled, &[untitled.clone()]), "loose.md");
+        let wrapped = sample_hit("/notes/intent.md", Some("Intent — 第 2 批\n；下一行不換行"));
+        assert_eq!(
+            hit_label(&wrapped, &[wrapped.clone()]),
+            "Intent — 第 2 批 ；下一行不換行"
+        );
     }
 
     #[test]
