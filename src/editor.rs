@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DISK_POLL: Duration = Duration::from_secs(2);
+/// Quiet time after the last keystroke before the note is written on its own.
+pub const AUTOSAVE_DELAY: Duration = Duration::from_secs(1);
 
 pub struct OpenNote {
     pub path: PathBuf,
@@ -15,6 +17,8 @@ pub struct OpenNote {
     pub has_conflict: bool,
     pub error: String,
     last_poll: Instant,
+    /// Last edit, or last failed autosave; autosave waits AUTOSAVE_DELAY after it.
+    edited_at: Option<Instant>,
 }
 
 impl OpenNote {
@@ -27,6 +31,7 @@ impl OpenNote {
             has_conflict: false,
             error: String::new(),
             last_poll: Instant::now(),
+            edited_at: None,
         })
     }
 
@@ -54,6 +59,36 @@ impl OpenNote {
                 false
             }
         }
+    }
+
+    pub fn mark_edited(&mut self, at: Instant) {
+        self.edited_at = Some(at);
+    }
+
+    pub fn is_autosave_due(&self, now: Instant) -> bool {
+        self.is_dirty()
+            && !self.has_conflict
+            && self
+                .edited_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= AUTOSAVE_DELAY)
+    }
+
+    /// Saves once typing has paused. Returns true when the file was written.
+    /// A failed write waits another AUTOSAVE_DELAY instead of retrying every frame.
+    pub fn autosave(&mut self, now: Instant) -> bool {
+        if !self.is_autosave_due(now) {
+            return false;
+        }
+        let saved = self.save();
+        if !saved {
+            self.edited_at = Some(now);
+        }
+        saved
+    }
+
+    /// Before leaving this note: true when nothing is left unsaved.
+    pub fn save_if_dirty(&mut self) -> bool {
+        !self.is_dirty() || self.save()
     }
 
     /// Drops local edits and takes the file as it is on disk.
@@ -101,6 +136,78 @@ impl OpenNote {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn edited(path: &Path, text: &str, at: Instant) -> OpenNote {
+        let mut note = OpenNote::load(path).unwrap();
+        note.text = text.into();
+        note.mark_edited(at);
+        note
+    }
+
+    #[test]
+    fn autosave_waits_for_a_pause_in_typing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "one").unwrap();
+        let start = Instant::now();
+        let mut note = edited(&path, "one two", start);
+        assert!(!note.autosave(start + Duration::from_millis(500)));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one");
+        assert!(note.autosave(start + AUTOSAVE_DELAY));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one two");
+        assert!(!note.is_dirty());
+        assert!(!note.autosave(start + AUTOSAVE_DELAY * 3), "nothing left to save");
+    }
+
+    #[test]
+    fn autosave_never_overwrites_an_outside_change() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "one").unwrap();
+        let start = Instant::now();
+        let mut note = edited(&path, "mine", start);
+        fs::write(&path, "theirs").unwrap();
+        assert!(!note.autosave(start + AUTOSAVE_DELAY));
+        assert!(note.has_conflict);
+        assert!(!note.autosave(start + AUTOSAVE_DELAY * 5));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+        assert_eq!(note.text, "mine");
+    }
+
+    #[test]
+    fn autosave_backs_off_after_a_write_error() {
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join("gone");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join("a.md");
+        fs::write(&path, "one").unwrap();
+        let start = Instant::now();
+        let mut note = edited(&path, "two", start);
+        fs::remove_dir_all(&folder).unwrap();
+        assert!(!note.autosave(start + AUTOSAVE_DELAY));
+        assert!(note.error.starts_with("無法儲存"));
+        assert!(!note.is_autosave_due(start + AUTOSAVE_DELAY + Duration::from_millis(500)));
+        assert!(note.is_autosave_due(start + AUTOSAVE_DELAY * 2));
+        assert_eq!(note.text, "two", "text is kept after a failed write");
+    }
+
+    #[test]
+    fn save_if_dirty_skips_clean_notes_and_respects_conflicts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "one").unwrap();
+        let mut clean = OpenNote::load(&path).unwrap();
+        assert!(clean.save_if_dirty());
+
+        let mut dirty = edited(&path, "two", Instant::now());
+        assert!(dirty.save_if_dirty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+
+        let mut stale = edited(&path, "mine", Instant::now());
+        fs::write(&path, "theirs").unwrap();
+        assert!(!stale.save_if_dirty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+    }
 
     #[test]
     fn save_writes_and_clears_dirty() {

@@ -187,11 +187,20 @@ impl NoteSyncApp {
         if same {
             return;
         }
-        if self.editor_dirty() {
-            self.pending = Some(Pending::Open(path));
-        } else {
+        if self.save_before_leaving() {
             self.open(&path);
+        } else {
+            self.pending = Some(Pending::Open(path));
         }
+    }
+
+    /// Saves unsaved text before switching away or closing.
+    /// False only when the text could not be written (conflict or write error).
+    fn save_before_leaving(&mut self) -> bool {
+        if !self.editor_dirty() {
+            return true;
+        }
+        self.save()
     }
 
     fn open(&mut self, path: &Path) {
@@ -256,7 +265,7 @@ impl NoteSyncApp {
     /// Unsaved text must never vanish with the window.
     fn guard_close(&mut self, ctx: &egui::Context) {
         let asked = ctx.input(|input| input.viewport().close_requested());
-        if asked && !self.may_close && self.editor_dirty() {
+        if asked && !self.may_close && !self.save_before_leaving() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending = Some(Pending::Close);
         }
@@ -497,9 +506,8 @@ impl NoteSyncApp {
             ui.centered_and_justified(|ui| ui.weak("← 選一則筆記"));
             return;
         };
-        let mut save = false;
         let mut reload = false;
-        show_editor_header(ui, editor, &mut save);
+        show_editor_header(ui, editor);
         if editor.has_conflict {
             reload = show_conflict_banner(ui);
         }
@@ -507,7 +515,7 @@ impl NoteSyncApp {
         if clear_undo {
             forget_undo(ui.ctx(), editor_id);
         }
-        egui::ScrollArea::vertical()
+        let edited = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add_sized(
@@ -517,14 +525,22 @@ impl NoteSyncApp {
                         .lock_focus(true)
                         .frame(false)
                         .font(egui::FontId::proportional(16.0)),
-                );
-            });
+                )
+                .changed()
+            })
+            .inner;
+        if edited {
+            editor.mark_edited(Instant::now());
+        }
         if reload {
             editor.reload();
             self.clear_undo = true;
         }
-        if save {
-            self.save();
+    }
+
+    fn autosave(&mut self) {
+        if self.editor.as_mut().is_some_and(|e| e.autosave(Instant::now())) {
+            self.rescan();
         }
     }
 
@@ -549,21 +565,31 @@ impl NoteSyncApp {
         if self.pending.is_none() {
             return;
         }
-        let title = self
-            .editor
-            .as_ref()
-            .map(|e| notes::note_title(&e.path))
-            .unwrap_or_default();
+        let Some(editor) = self.editor.as_ref() else {
+            self.pending = None;
+            return;
+        };
+        let title = notes::note_title(&editor.path);
+        let can_retry = !editor.has_conflict;
+        let reason = if editor.has_conflict {
+            "這則筆記在別的地方被改過了。".to_string()
+        } else {
+            editor.error.clone()
+        };
         let mut choice = None;
+        // Only shown when saving failed; normal edits are saved on their own.
         let modal = egui::Modal::new(Id::new("unsaved")).show(ctx, |ui| {
-            ui.set_width(340.0);
-            ui.heading(format!("要儲存「{title}」嗎？"));
+            ui.set_width(360.0);
+            ui.heading(format!("「{title}」存不進去"));
+            if !reason.is_empty() {
+                ui.label(&reason);
+            }
             ui.add_space(16.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(widgets::primary_button(ui, "儲存", 15.0)).clicked() {
+                if can_retry && ui.add(widgets::primary_button(ui, "再試一次", 15.0)).clicked() {
                     choice = Some(Choice::Save);
                 }
-                if ui.button("不儲存").clicked() {
+                if ui.button("放棄修改").clicked() {
                     choice = Some(Choice::Discard);
                 }
                 if ui.button("取消").clicked() {
@@ -621,23 +647,29 @@ impl eframe::App for NoteSyncApp {
                 .show(ctx, |ui| self.show_editor(ui));
         }
         self.show_unsaved_dialog(ctx);
+        self.autosave();
         self.dirty_editor.store(self.editor_dirty(), Ordering::Relaxed);
 
-        let waiting = self.scan.is_some() || self.extra.is_busy() || self.scheduler.is_running();
+        let waiting = self.scan.is_some()
+            || self.extra.is_busy()
+            || self.scheduler.is_running()
+            || self.editor.as_ref().is_some_and(|e| e.is_dirty() && !e.has_conflict);
         let next = if waiting { 200 } else { 1000 };
         ctx.request_repaint_after(Duration::from_millis(next));
     }
+
+    /// Last chance for Dock "Quit" and logout, which skip the close request.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.save_if_dirty();
+        }
+    }
 }
 
-fn show_editor_header(ui: &mut egui::Ui, editor: &OpenNote, save: &mut bool) {
+fn show_editor_header(ui: &mut egui::Ui, editor: &OpenNote) {
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if editor.is_dirty() {
-                let button = widgets::primary_button(ui, "儲存", 15.0).shortcut_text("⌘S");
-                *save = ui.add_enabled(!editor.has_conflict, button).clicked();
-            } else {
-                ui.weak("✓ 已儲存");
-            }
+            ui.weak(if editor.is_dirty() { "● 編輯中" } else { "✓ 已儲存" });
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.add(egui::Label::new(RichText::new(notes::note_title(&editor.path)).heading()).truncate())
                     .on_hover_text(editor.path.display().to_string());

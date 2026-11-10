@@ -29,7 +29,7 @@ pub struct BackupState<'a> {
 
 pub fn backup_status(state: &BackupState, now: SystemTime) -> StatusLine {
     if state.editor_dirty {
-        return line(Tone::Quiet, "✎ 儲存後就會備份");
+        return line(Tone::Quiet, "✎ 編輯中");
     }
     if state.is_running {
         return line(Tone::Quiet, "↻ 正在備份…");
@@ -166,7 +166,7 @@ mod tests {
         let mut s = state(None);
         s.editor_dirty = true;
         s.is_running = true;
-        assert_eq!(backup_status(&s, SystemTime::now()).text, "✎ 儲存後就會備份");
+        assert_eq!(backup_status(&s, SystemTime::now()).text, "✎ 編輯中");
     }
 
     #[test]
