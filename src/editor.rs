@@ -21,6 +21,8 @@ pub struct OpenNote {
     edited_at: Option<Instant>,
     /// An input method is composing text (e.g. 注音 candidates still open).
     pub is_composing: bool,
+    /// The last unattended save could not read the file (moved, deleted, not UTF-8).
+    pub is_unreadable: bool,
 }
 
 impl OpenNote {
@@ -35,6 +37,7 @@ impl OpenNote {
             last_poll: Instant::now(),
             edited_at: None,
             is_composing: false,
+            is_unreadable: false,
         })
     }
 
@@ -54,6 +57,7 @@ impl OpenNote {
             Ok(()) => {
                 self.saved = self.text.clone();
                 self.has_conflict = false;
+                self.is_unreadable = false;
                 self.error.clear();
                 true
             }
@@ -99,8 +103,12 @@ impl OpenNote {
     /// (moved, deleted, not UTF-8) its state is unknown, so nothing is written.
     fn save_unattended(&mut self) -> bool {
         match fs::read_to_string(&self.path) {
-            Ok(_) => self.save(),
+            Ok(_) => {
+                self.is_unreadable = false;
+                self.save()
+            }
             Err(err) => {
+                self.is_unreadable = true;
                 self.error = format!("無法確認檔案現況，先不儲存：{err}");
                 false
             }
@@ -114,6 +122,7 @@ impl OpenNote {
                 self.saved = text.clone();
                 self.text = text;
                 self.has_conflict = false;
+                self.is_unreadable = false;
                 self.error.clear();
             }
             Err(err) => self.error = format!("無法讀取：{err}"),
@@ -234,6 +243,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
         assert!(!moved.autosave(start + AUTOSAVE_DELAY));
         assert!(!moved.save_if_dirty());
+        assert!(moved.is_unreadable);
         assert!(!path.exists(), "the moved note is not brought back");
         assert_eq!(moved.text, "mine");
 

@@ -198,10 +198,18 @@ impl NoteSyncApp {
     /// Saves unsaved text before switching away or closing.
     /// False only when the text could not be written (conflict or write error).
     fn save_before_leaving(&mut self) -> bool {
-        if !self.editor_dirty() {
+        let Some(editor) = self.editor.as_mut() else {
+            return true;
+        };
+        if !editor.is_dirty() {
             return true;
         }
-        self.save()
+        // Unattended: refuses when the file cannot be read, so the dialog asks instead.
+        let saved = editor.save_if_dirty();
+        if saved {
+            self.rescan();
+        }
+        saved
     }
 
     fn open(&mut self, path: &Path) {
@@ -229,7 +237,8 @@ impl NoteSyncApp {
         };
         let go_on = match choice {
             Choice::Cancel => false,
-            Choice::Save => self.save_before_leaving(),
+            // "再試一次" is the user's own request, so it keeps the attended save().
+            Choice::Save => !self.editor_dirty() || self.save(),
             Choice::Discard => {
                 if let Some(editor) = self.editor.as_mut() {
                     editor.reload();
@@ -583,7 +592,7 @@ impl NoteSyncApp {
             return;
         }
         let title = notes::note_title(&editor.path);
-        let can_retry = !editor.has_conflict;
+        let can_retry = !editor.has_conflict && !editor.is_unreadable;
         let reason = if editor.has_conflict {
             "這則筆記在別的地方被改過了。".to_string()
         } else {
