@@ -1,6 +1,7 @@
 pub mod app_ui;
 pub mod config;
 pub mod editor;
+pub mod editor_view;
 pub mod extra_search;
 pub mod git_ops;
 pub mod labels;

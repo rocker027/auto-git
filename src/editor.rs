@@ -19,6 +19,8 @@ pub struct OpenNote {
     last_poll: Instant,
     /// Last edit, or last failed autosave; autosave waits AUTOSAVE_DELAY after it.
     edited_at: Option<Instant>,
+    /// An input method is composing text (e.g. 注音 candidates still open).
+    pub is_composing: bool,
 }
 
 impl OpenNote {
@@ -32,6 +34,7 @@ impl OpenNote {
             error: String::new(),
             last_poll: Instant::now(),
             edited_at: None,
+            is_composing: false,
         })
     }
 
@@ -68,6 +71,7 @@ impl OpenNote {
     pub fn is_autosave_due(&self, now: Instant) -> bool {
         self.is_dirty()
             && !self.has_conflict
+            && !self.is_composing
             && self
                 .edited_at
                 .is_some_and(|at| now.saturating_duration_since(at) >= AUTOSAVE_DELAY)
@@ -79,7 +83,7 @@ impl OpenNote {
         if !self.is_autosave_due(now) {
             return false;
         }
-        let saved = self.save();
+        let saved = self.save_unattended();
         if !saved {
             self.edited_at = Some(now);
         }
@@ -88,7 +92,19 @@ impl OpenNote {
 
     /// Before leaving this note: true when nothing is left unsaved.
     pub fn save_if_dirty(&mut self) -> bool {
-        !self.is_dirty() || self.save()
+        !self.is_dirty() || self.save_unattended()
+    }
+
+    /// Like `save`, but for writes nobody asked for: when the file cannot be read
+    /// (moved, deleted, not UTF-8) its state is unknown, so nothing is written.
+    fn save_unattended(&mut self) -> bool {
+        match fs::read_to_string(&self.path) {
+            Ok(_) => self.save(),
+            Err(err) => {
+                self.error = format!("無法確認檔案現況，先不儲存：{err}");
+                false
+            }
+        }
     }
 
     /// Drops local edits and takes the file as it is on disk.
@@ -185,10 +201,47 @@ mod tests {
         let mut note = edited(&path, "two", start);
         fs::remove_dir_all(&folder).unwrap();
         assert!(!note.autosave(start + AUTOSAVE_DELAY));
-        assert!(note.error.starts_with("無法儲存"));
+        assert!(!note.error.is_empty());
         assert!(!note.is_autosave_due(start + AUTOSAVE_DELAY + Duration::from_millis(500)));
         assert!(note.is_autosave_due(start + AUTOSAVE_DELAY * 2));
         assert_eq!(note.text, "two", "text is kept after a failed write");
+    }
+
+    #[test]
+    fn autosave_waits_while_an_input_method_is_composing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "hello").unwrap();
+        let start = Instant::now();
+        let mut note = edited(&path, "helloㄓㄨㄥ", start);
+        note.is_composing = true;
+        assert!(!note.autosave(start + AUTOSAVE_DELAY * 5));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+        note.text = "hello中".into();
+        note.is_composing = false;
+        note.mark_edited(start + AUTOSAVE_DELAY * 5);
+        assert!(note.autosave(start + AUTOSAVE_DELAY * 6));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello中");
+    }
+
+    #[test]
+    fn unattended_saves_do_not_recreate_a_moved_or_unreadable_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        fs::write(&path, "one").unwrap();
+        let start = Instant::now();
+        let mut moved = edited(&path, "mine", start);
+        fs::remove_file(&path).unwrap();
+        assert!(!moved.autosave(start + AUTOSAVE_DELAY));
+        assert!(!moved.save_if_dirty());
+        assert!(!path.exists(), "the moved note is not brought back");
+        assert_eq!(moved.text, "mine");
+
+        fs::write(&path, "one").unwrap();
+        let mut garbled = edited(&path, "mine", start);
+        fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        assert!(!garbled.autosave(start + AUTOSAVE_DELAY));
+        assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0xfe, 0x00]);
     }
 
     #[test]
