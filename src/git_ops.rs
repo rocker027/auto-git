@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8,14 +9,20 @@ pub enum CommitOutcome {
     SkippedNoChanges,
     SkippedStagedPresent,
     SkippedBusyState(String),
+    /// The folder sits inside a bigger repo (its root is given); committing would
+    /// take in files outside the folder.
+    SkippedNotRepoRoot(PathBuf),
 }
 
-pub fn run_git(git: &Path, repo: &Path, args: &[&str]) -> Result<std::process::Output> {
+pub fn run_git<S: AsRef<OsStr>>(git: &Path, repo: &Path, args: &[S]) -> Result<std::process::Output> {
     Command::new(git)
         .args(args)
         .current_dir(repo)
         .output()
-        .with_context(|| format!("spawn {} {:?}", git.display(), args))
+        .with_context(|| {
+            let shown: Vec<_> = args.iter().map(|a| a.as_ref().to_string_lossy()).collect();
+            format!("spawn {} {:?}", git.display(), shown)
+        })
 }
 
 pub fn is_git_repo(git: &Path, folder: &Path) -> bool {
@@ -36,6 +43,62 @@ pub fn ensure_git_repo(git: &Path, folder: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The repo root when it is not `folder` itself; None when `folder` is the root.
+/// Compares file identity, not path text, so symlinks, `/var` vs `/private/var`
+/// and Unicode forms of the same directory still count as the root.
+/// Any failure is an error, so the caller never commits on a guess.
+pub fn outer_repo_root(git: &Path, folder: &Path) -> Result<Option<PathBuf>> {
+    let out = run_git(git, folder, &["rev-parse", "--show-toplevel"])?;
+    if !out.status.success() {
+        bail!(
+            "git rev-parse --show-toplevel failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // Only the trailing newline is git's; a folder name may itself end in spaces.
+    let raw = out.stdout.strip_suffix(b"\n").unwrap_or(&out.stdout);
+    let root = path_from_bytes(raw);
+    if is_same_dir(&root, folder)? {
+        Ok(None)
+    } else {
+        Ok(Some(root))
+    }
+}
+
+#[cfg(unix)]
+fn path_from_bytes(raw: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(OsStr::from_bytes(raw))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(raw: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(raw).into_owned())
+}
+
+#[cfg(unix)]
+fn is_same_dir(a: &Path, b: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let meta_a = std::fs::metadata(a).with_context(|| format!("stat {}", a.display()))?;
+    let meta_b = std::fs::metadata(b).with_context(|| format!("stat {}", b.display()))?;
+    Ok(meta_a.dev() == meta_b.dev() && meta_a.ino() == meta_b.ino())
+}
+
+#[cfg(not(unix))]
+fn is_same_dir(a: &Path, b: &Path) -> Result<bool> {
+    Ok(std::fs::canonicalize(a)? == std::fs::canonicalize(b)?)
+}
+
+/// Time of the newest commit, or None when the repo has no commits yet.
+pub fn last_commit_time(git: &Path, repo: &Path) -> Option<std::time::SystemTime> {
+    let out = run_git(git, repo, &["log", "-1", "--format=%ct"]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let secs: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
 }
 
 /// Returns porcelain status lines (one per changed path entry).
@@ -107,6 +170,10 @@ fn count_paths(lines: &[String]) -> usize {
 
 pub fn auto_commit(git: &Path, repo: &Path, skip_if_staged: bool) -> Result<CommitOutcome> {
     ensure_git_repo(git, repo)?;
+    // Before anything is staged: `git add -A` would cover the whole outer repo.
+    if let Some(root) = outer_repo_root(git, repo)? {
+        return Ok(CommitOutcome::SkippedNotRepoRoot(root));
+    }
 
     if let Some(busy) = is_busy_state(git, repo)? {
         return Ok(CommitOutcome::SkippedBusyState(busy));
@@ -199,6 +266,87 @@ mod tests {
         fs::write(repo.join("b.md"), "2\n").unwrap();
         let out = auto_commit(git_bin(), repo, true).unwrap();
         assert_eq!(out, CommitOutcome::SkippedStagedPresent);
+    }
+
+    fn head_of(repo: &Path) -> String {
+        let out = run_git(git_bin(), repo, &["rev-parse", "HEAD"]).unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn subfolder_of_a_repo_is_never_committed() {
+        let dir = tempdir().unwrap();
+        let outer = dir.path();
+        ensure_git_repo(git_bin(), outer).unwrap();
+        configure_identity(outer);
+        fs::write(outer.join("code.rs"), "fn main() {}\n").unwrap();
+        run_git(git_bin(), outer, &["add", "-A"]).unwrap();
+        run_git(git_bin(), outer, &["commit", "-m", "base"]).unwrap();
+        let head = head_of(outer);
+
+        let notes = outer.join("notes");
+        fs::create_dir(&notes).unwrap();
+        fs::write(notes.join("a.md"), "# a\n").unwrap();
+        fs::write(outer.join("code.rs"), "changed outside the notes\n").unwrap();
+
+        match auto_commit(git_bin(), &notes, true).unwrap() {
+            CommitOutcome::SkippedNotRepoRoot(root) => {
+                assert!(is_same_dir(&root, outer).unwrap());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(head_of(outer), head, "no new commit");
+        let status = status_porcelain(git_bin(), outer).unwrap();
+        assert!(!has_staged_changes(&status), "nothing staged: {status:?}");
+        assert!(!notes.join(".git").exists(), "no nested repo created");
+        assert_eq!(fs::read_to_string(outer.join("code.rs")).unwrap(), "changed outside the notes\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_the_root_still_counts_as_the_root() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        ensure_git_repo(git_bin(), &real).unwrap();
+        configure_identity(&real);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        fs::write(real.join("a.md"), "x\n").unwrap();
+        let out = auto_commit(git_bin(), &link, true).unwrap();
+        assert!(matches!(out, CommitOutcome::Committed { files: 1, .. }), "{out:?}");
+        assert!(last_commit_time(git_bin(), &real).is_some());
+    }
+
+    #[test]
+    fn unknown_root_fails_closed() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        ensure_git_repo(git_bin(), repo).unwrap();
+        configure_identity(repo);
+        fs::write(repo.join("a.md"), "x\n").unwrap();
+        // Inside .git there is no work tree, so the root cannot be found.
+        assert!(outer_repo_root(git_bin(), &repo.join(".git")).is_err());
+        assert!(auto_commit(git_bin(), &repo.join(".git"), true).is_err());
+        assert!(run_git(git_bin(), repo, &["rev-parse", "--verify", "-q", "HEAD"]).unwrap().stdout.is_empty());
+    }
+
+    #[test]
+    fn root_whose_name_ends_in_a_space_is_still_the_root() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("筆記 ");
+        fs::create_dir(&repo).unwrap();
+        ensure_git_repo(git_bin(), &repo).unwrap();
+        configure_identity(&repo);
+        fs::write(repo.join("a.md"), "x\n").unwrap();
+        assert!(matches!(auto_commit(git_bin(), &repo, true).unwrap(), CommitOutcome::Committed { .. }));
+    }
+
+    #[test]
+    fn empty_repo_has_no_last_commit_time() {
+        let dir = tempdir().unwrap();
+        ensure_git_repo(git_bin(), dir.path()).unwrap();
+        assert_eq!(last_commit_time(git_bin(), dir.path()), None);
     }
 
     #[test]

@@ -25,6 +25,8 @@ pub struct BackupState<'a> {
     pub is_running: bool,
     pub is_paused: bool,
     pub editor_dirty: bool,
+    /// Last time the app wrote a note to disk.
+    pub last_saved_at: Option<SystemTime>,
 }
 
 pub fn backup_status(state: &BackupState, now: SystemTime) -> StatusLine {
@@ -43,8 +45,32 @@ pub fn backup_status(state: &BackupState, now: SystemTime) -> StatusLine {
     if let Some(problem) = first_problem(report) {
         return problem;
     }
-    let ago = time_ago(now.duration_since(report.finished_at).unwrap_or_default());
-    line(Tone::Good, &format!("✓ 已備份 · {ago}"))
+    if state.last_saved_at.is_some_and(|saved| saved >= report.started_at) {
+        return StatusLine {
+            tone: Tone::Quiet,
+            text: "◔ 已存檔，等下次備份".into(),
+            detail: Some("下次自動備份時會建立版本。要馬上建立，請按 ⋯ →「立即備份」。".into()),
+        };
+    }
+    backed_up_line(report, now)
+}
+
+/// The age shown is of the newest version; when it was last checked is on hover.
+fn backed_up_line(report: &BackupReport, now: SystemTime) -> StatusLine {
+    let age = |at: SystemTime| time_ago(now.duration_since(at).unwrap_or_default());
+    let checked = format!("最近檢查：{}", age(report.finished_at));
+    match report.last_commit_at {
+        Some(version) => StatusLine {
+            tone: Tone::Good,
+            text: format!("✓ 已備份 · {}", age(version)),
+            detail: Some(format!("最新版本建立於 {}\n{checked}", age(version))),
+        },
+        None => StatusLine {
+            tone: Tone::Good,
+            text: format!("✓ 已檢查 · {}", age(report.finished_at)),
+            detail: Some(format!("還沒有任何版本，沒有需要備份的檔案\n{checked}")),
+        },
+    }
 }
 
 fn line(tone: Tone, text: &str) -> StatusLine {
@@ -93,6 +119,14 @@ fn folder_problem(folder: &Path, result: &FolderBackup) -> Option<(String, Strin
             format!("「{name}」正在合併，先跳過"),
             format!("{path}\nGit 正在進行 {state}。完成後會自動備份。"),
         )),
+        FolderBackup::Done(CommitOutcome::SkippedNotRepoRoot(root)) => Some((
+            format!("「{name}」在另一個 Git 專案裡，先不備份"),
+            format!(
+                "{path}\n它在 {} 這個 Git 專案裡面。為了不把資料夾外的檔案一起備份，只備份本身就是專案最上層的資料夾。\n請改加入 {}，或把筆記搬到獨立的資料夾。",
+                root.display(),
+                root.display()
+            ),
+        )),
         FolderBackup::Missing => Some((
             format!("找不到「{name}」"),
             format!("{path}\n資料夾不見了。可以從選單移除它。"),
@@ -132,11 +166,13 @@ mod tests {
 
     fn report(results: Vec<(&str, FolderBackup)>, at: SystemTime) -> BackupReport {
         BackupReport {
+            started_at: at,
             finished_at: at,
             folders: results
                 .into_iter()
                 .map(|(p, r)| (PathBuf::from(p), r))
                 .collect(),
+            last_commit_at: None,
         }
     }
 
@@ -146,19 +182,66 @@ mod tests {
             is_running: false,
             is_paused: false,
             editor_dirty: false,
+            last_saved_at: None,
         }
     }
 
+    /// The age is of the newest version, not of the last check (changed 2026-11-10).
     #[test]
-    fn clean_run_says_backed_up_with_age() {
+    fn backed_up_shows_the_age_of_the_newest_version() {
+        let now = SystemTime::now();
+        let mut done = report(
+            vec![("/n", FolderBackup::Done(CommitOutcome::SkippedNoChanges))],
+            now - Duration::from_secs(60),
+        );
+        done.last_commit_at = Some(now - Duration::from_secs(3 * 3600));
+        let status = backup_status(&state(Some(&done)), now);
+        assert_eq!(status.tone, Tone::Good);
+        assert_eq!(status.text, "✓ 已備份 · 3 小時前");
+        assert!(status.detail.unwrap().contains("最近檢查：1 分鐘前"));
+    }
+
+    #[test]
+    fn no_version_yet_says_checked() {
         let now = SystemTime::now();
         let done = report(
             vec![("/n", FolderBackup::Done(CommitOutcome::SkippedNoChanges))],
             now - Duration::from_secs(180),
         );
-        let status = backup_status(&state(Some(&done)), now);
-        assert_eq!(status.tone, Tone::Good);
-        assert_eq!(status.text, "✓ 已備份 · 3 分鐘前");
+        assert_eq!(backup_status(&state(Some(&done)), now).text, "✓ 已檢查 · 3 分鐘前");
+    }
+
+    #[test]
+    fn a_save_after_the_run_started_waits_for_the_next_backup() {
+        let now = SystemTime::now();
+        let mut done = report(
+            vec![("/n", FolderBackup::Done(CommitOutcome::SkippedNoChanges))],
+            now - Duration::from_secs(60),
+        );
+        done.last_commit_at = Some(now - Duration::from_secs(60));
+        let mut s = state(Some(&done));
+        s.last_saved_at = Some(now - Duration::from_secs(30));
+        let status = backup_status(&s, now);
+        assert_eq!(status.tone, Tone::Quiet);
+        assert_eq!(status.text, "◔ 已存檔，等下次備份");
+        s.last_saved_at = Some(now - Duration::from_secs(90));
+        assert_eq!(backup_status(&s, now).text, "✓ 已備份 · 1 分鐘前", "saved before the run");
+    }
+
+    #[test]
+    fn folder_inside_another_repo_is_a_problem() {
+        let now = SystemTime::now();
+        let skipped = report(
+            vec![(
+                "/code/app/notes",
+                FolderBackup::Done(CommitOutcome::SkippedNotRepoRoot(PathBuf::from("/code/app"))),
+            )],
+            now,
+        );
+        let status = backup_status(&state(Some(&skipped)), now);
+        assert_eq!(status.tone, Tone::Problem);
+        assert_eq!(status.text, "⚠ 「notes」在另一個 Git 專案裡，先不備份");
+        assert!(status.detail.unwrap().contains("/code/app"));
     }
 
     #[test]

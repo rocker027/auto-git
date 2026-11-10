@@ -5,12 +5,21 @@ use crate::notes;
 use eframe::egui::{self, Id, RichText};
 use std::time::Instant;
 
-pub fn show_editor_header(ui: &mut egui::Ui, editor: &OpenNote, is_preview: &mut bool) {
+/// What the editor panel shows for the open note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Edit,
+    Preview,
+    /// Backed-up versions, read only.
+    History,
+}
+
+pub fn show_editor_header(ui: &mut egui::Ui, editor: &OpenNote, mode: &mut ViewMode) {
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.weak(if editor.is_dirty() { "● 編輯中" } else { "✓ 已儲存" });
             ui.add_space(12.0);
-            show_mode_switch(ui, is_preview);
+            show_mode_switch(ui, mode);
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.add(egui::Label::new(RichText::new(notes::note_title(&editor.path)).heading()).truncate())
                     .on_hover_text(editor.path.display().to_string());
@@ -23,15 +32,27 @@ pub fn show_editor_header(ui: &mut egui::Ui, editor: &OpenNote, is_preview: &mut
     ui.add_space(8.0);
 }
 
-/// Two-segment 編輯｜預覽 switch; ⌘E does the same.
-/// Added right to left, so 預覽 comes first.
-fn show_mode_switch(ui: &mut egui::Ui, is_preview: &mut bool) {
+/// 編輯｜預覽｜歷史 switch; ⌘E flips between 編輯 and 預覽.
+/// Added right to left, so 歷史 comes first.
+fn show_mode_switch(ui: &mut egui::Ui, mode: &mut ViewMode) {
     ui.spacing_mut().item_spacing.x = 2.0;
-    if ui.selectable_label(*is_preview, "預覽").on_hover_text("⌘E").clicked() {
-        *is_preview = true;
+    let segments = [
+        (ViewMode::History, "歷史", "已備份的版本"),
+        (ViewMode::Preview, "預覽", "⌘E"),
+        (ViewMode::Edit, "編輯", "⌘E"),
+    ];
+    for (segment, label, hint) in segments {
+        if ui.selectable_label(*mode == segment, label).on_hover_text(hint).clicked() {
+            *mode = segment;
+        }
     }
-    if ui.selectable_label(!*is_preview, "編輯").on_hover_text("⌘E").clicked() {
-        *is_preview = false;
+}
+
+/// ⌘E: 編輯 ↔ 預覽; from 歷史 it goes back to 編輯.
+pub fn toggled_mode(mode: ViewMode) -> ViewMode {
+    match mode {
+        ViewMode::Edit => ViewMode::Preview,
+        ViewMode::Preview | ViewMode::History => ViewMode::Edit,
     }
 }
 
@@ -245,6 +266,13 @@ mod tests {
         );
         fs::write(dir.path().join("run.sh"), "echo").unwrap();
         assert_eq!(resolve_note_link(&note, "run.sh"), None);
+    }
+
+    #[test]
+    fn command_e_leaves_history_for_the_editor() {
+        assert_eq!(toggled_mode(ViewMode::Edit), ViewMode::Preview);
+        assert_eq!(toggled_mode(ViewMode::Preview), ViewMode::Edit);
+        assert_eq!(toggled_mode(ViewMode::History), ViewMode::Edit);
     }
 
     #[test]

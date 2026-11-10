@@ -34,8 +34,11 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let icon = make_icon();
             let menu = Menu::new();
+            let backup_status = note_sync::tray_status::TrayStatus::default();
             let show_item = MenuItem::new("顯示視窗", true, None);
             let quit_item = MenuItem::new("結束", true, None);
+            let _ = menu.append(&backup_status.item);
+            let _ = menu.append(&PredefinedMenuItem::separator());
             let _ = menu.append(&show_item);
             let _ = menu.append(&PredefinedMenuItem::separator());
             let _ = menu.append(&quit_item);
@@ -62,6 +65,7 @@ fn main() -> eframe::Result {
             let menus = SystemMenus {
                 tray: tray_c.borrow_mut().take(),
                 show_item,
+                backup_status,
                 quit_items: vec![quit_item, app_quit],
                 app_menu,
                 quitting,
@@ -109,7 +113,7 @@ fn make_app_menu() -> (Option<Menu>, MenuItem) {
 }
 
 fn install_cjk_fallback(ctx: &egui::Context) {
-    let Some(bytes) = note_sync::app_ui::cjk_font_bytes() else {
+    let Some(bytes) = note_sync::platform::cjk_font_bytes() else {
         return;
     };
     let mut fonts = egui::FontDefinitions::default();

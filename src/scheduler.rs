@@ -17,8 +17,12 @@ pub enum FolderBackup {
 /// Result of the latest backup run over every watched folder.
 #[derive(Debug, Clone)]
 pub struct BackupReport {
+    /// A save after this moment may not be in the run's commits.
+    pub started_at: SystemTime,
     pub finished_at: SystemTime,
     pub folders: Vec<(PathBuf, FolderBackup)>,
+    /// Newest commit over every watched folder, from before or during this run.
+    pub last_commit_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Default)]
@@ -151,13 +155,25 @@ fn set_running(state: &Mutex<SchedulerState>, running: bool) {
 }
 
 pub fn back_up_folders(git: &Path, folders: &[PathBuf], skip_if_staged: bool) -> BackupReport {
-    let folders = folders
+    let started_at = SystemTime::now();
+    let results: Vec<(PathBuf, FolderBackup)> = folders
         .iter()
         .map(|folder| (folder.clone(), back_up_folder(git, folder, skip_if_staged)))
         .collect();
+    let last_commit_at = results
+        .iter()
+        // A folder inside another repo would report that repo's commits.
+        .filter(|(_, result)| {
+            matches!(result, FolderBackup::Done(outcome)
+                if !matches!(outcome, CommitOutcome::SkippedNotRepoRoot(_)))
+        })
+        .filter_map(|(folder, _)| git_ops::last_commit_time(git, folder))
+        .max();
     BackupReport {
+        started_at,
         finished_at: SystemTime::now(),
-        folders,
+        folders: results,
+        last_commit_at,
     }
 }
 
@@ -174,6 +190,57 @@ fn back_up_folder(git: &Path, folder: &Path, skip_if_staged: bool) -> FolderBack
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::status::{backup_status, BackupState, Tone};
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let out = git_ops::run_git(Path::new("git"), repo, args).unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn new_repo(dir: &Path) {
+        git(dir, &["init"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test"]);
+    }
+
+    fn status_text(report: &BackupReport) -> (Tone, String) {
+        let state = BackupState {
+            report: Some(report),
+            is_running: false,
+            is_paused: false,
+            editor_dirty: false,
+            last_saved_at: None,
+        };
+        let line = backup_status(&state, SystemTime::now());
+        (line.tone, line.text)
+    }
+
+    #[test]
+    fn backup_run_to_status_line() {
+        let dir = tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        fs::create_dir(&notes).unwrap();
+        new_repo(&notes);
+        fs::write(notes.join("a.md"), "# a\n").unwrap();
+
+        let report = back_up_folders(Path::new("git"), std::slice::from_ref(&notes), true);
+        assert!(report.last_commit_at.is_some());
+        assert!(report.started_at <= report.finished_at);
+        assert_eq!(status_text(&report), (Tone::Good, "✓ 已備份 · 剛剛".to_string()));
+
+        let inner = notes.join("inner");
+        fs::create_dir(&inner).unwrap();
+        fs::write(inner.join("b.md"), "# b\n").unwrap();
+        let report = back_up_folders(Path::new("git"), &[inner], true);
+        assert_eq!(report.last_commit_at, None, "skipped folders add no version time");
+        assert_eq!(
+            status_text(&report),
+            (Tone::Problem, "⚠ 「inner」在另一個 Git 專案裡，先不備份".to_string())
+        );
+    }
 
     #[test]
     fn missing_folder_is_reported() {

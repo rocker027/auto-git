@@ -10,23 +10,20 @@ use crate::scheduler::Scheduler;
 use crate::status::{self, BackupState, Tone};
 use crate::editor_view::{
     forget_undo, resolve_note_link, show_conflict_banner, show_editor_header, show_preview,
-    show_text_editor,
+    show_text_editor, toggled_mode, ViewMode,
 };
+use crate::history_view::HistoryPanel;
+use crate::platform::choose_folder;
 use crate::widgets;
 use crate::window_life::{self, CloseAction};
 use eframe::egui::{self, Id, RichText};
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-const CJK_FONT_CANDIDATES: &[&str] = &[
-    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-    "/Library/Fonts/Arial Unicode.ttf",
-];
 const RESCAN_EVERY: Duration = Duration::from_secs(10);
 const SEARCH_ID: &str = "note-search";
 
@@ -62,10 +59,13 @@ pub struct NoteSyncApp {
     may_close: bool,
     /// Folders whose notes are hidden in the list.
     collapsed: HashSet<PathBuf>,
-    /// Show the open note as rendered Markdown instead of the editor.
-    is_preview: bool,
-    /// Preview state of the previous frame, to give the editor its focus back.
-    was_preview: bool,
+    /// Editor, rendered Markdown, or backed-up versions of the open note.
+    mode: ViewMode,
+    /// The editor was shown last frame; when it comes back it gets the focus back.
+    was_editing: bool,
+    history: HistoryPanel,
+    /// Last time a note was written, so the status line can say a backup is still due.
+    last_saved_at: Option<SystemTime>,
     markdown_cache: egui_commonmark::CommonMarkCache,
     /// The editor text was just (re)loaded; old undo steps must not come back.
     clear_undo: bool,
@@ -76,6 +76,7 @@ pub struct NoteSyncApp {
 pub struct SystemMenus {
     pub tray: Option<tray_icon::TrayIcon>,
     pub show_item: tray_icon::menu::MenuItem,
+    pub backup_status: crate::tray_status::TrayStatus,
     /// Tray "結束" and the app menu's ⌘Q item; both go through the unsaved-text check.
     pub quit_items: Vec<tray_icon::menu::MenuItem>,
     pub app_menu: Option<tray_icon::menu::Menu>,
@@ -107,8 +108,10 @@ impl NoteSyncApp {
             may_close: false,
             clear_undo: false,
             collapsed: HashSet::new(),
-            is_preview: false,
-            was_preview: false,
+            mode: ViewMode::Edit,
+            was_editing: true,
+            history: HistoryPanel::default(),
+            last_saved_at: None,
             markdown_cache: egui_commonmark::CommonMarkCache::default(),
             menus,
         };
@@ -229,9 +232,14 @@ impl NoteSyncApp {
         // Unattended: refuses when the file cannot be read, so the dialog asks instead.
         let saved = editor.save_if_dirty();
         if saved {
-            self.rescan();
+            self.after_save();
         }
         saved
+    }
+
+    fn after_save(&mut self) {
+        self.last_saved_at = Some(SystemTime::now());
+        self.rescan();
     }
 
     fn open(&mut self, path: &Path) {
@@ -248,7 +256,7 @@ impl NoteSyncApp {
     fn save(&mut self) -> bool {
         let saved = self.editor.as_mut().is_some_and(OpenNote::save);
         if saved {
-            self.rescan();
+            self.after_save();
         }
         saved
     }
@@ -318,7 +326,7 @@ impl NoteSyncApp {
             )
         });
         if toggle_preview && self.editor.is_some() {
-            self.is_preview = !self.is_preview;
+            self.mode = toggled_mode(self.mode);
         }
         let can_save = self
             .editor
@@ -359,6 +367,7 @@ impl NoteSyncApp {
             is_running: self.scheduler.is_running(),
             is_paused: self.scheduler.is_paused(),
             editor_dirty: self.editor_dirty(),
+            last_saved_at: self.last_saved_at,
         };
         let line = status::backup_status(&state, SystemTime::now());
         let is_problem = line.tone == Tone::Problem;
@@ -372,7 +381,10 @@ impl NoteSyncApp {
                 };
                 if !is_problem {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add(egui::Label::new(RichText::new(&line.text).color(color)).truncate());
+                        let label = ui.add(egui::Label::new(RichText::new(&line.text).color(color)).truncate());
+                        if let Some(detail) = &line.detail {
+                            label.on_hover_text(detail);
+                        }
                     });
                 }
             });
@@ -561,7 +573,7 @@ impl NoteSyncApp {
             return;
         };
         let mut reload = false;
-        show_editor_header(ui, editor, &mut self.is_preview);
+        show_editor_header(ui, editor, &mut self.mode);
         if editor.has_conflict {
             reload = show_conflict_banner(ui);
         }
@@ -570,23 +582,41 @@ impl NoteSyncApp {
             forget_undo(ui.ctx(), editor_id);
         }
         let mut linked = None;
-        if self.is_preview {
-            editor.is_composing = false;
-            let links = show_preview(ui, &editor.text, &mut self.markdown_cache);
-            linked = links.iter().find_map(|url| resolve_note_link(&editor.path, url));
-        } else {
-            show_text_editor(ui, editor, editor_id);
-            // After the TextEdit: a click on 「編輯」 this frame would otherwise drop the focus again.
-            if self.was_preview {
-                ui.ctx().memory_mut(|memory| memory.request_focus(editor_id));
+        let mut restored = None;
+        if self.mode != ViewMode::History {
+            self.history.forget();
+        }
+        match self.mode {
+            ViewMode::Preview => {
+                editor.is_composing = false;
+                let links = show_preview(ui, &editor.text, &mut self.markdown_cache);
+                linked = links.iter().find_map(|url| resolve_note_link(&editor.path, url));
+            }
+            ViewMode::History => {
+                editor.is_composing = false;
+                let git = self.config.lock().unwrap().git_path.clone();
+                let can_write = !self.scheduler.is_running();
+                restored = self.history.show(ui, &editor.path, &git, can_write);
+            }
+            ViewMode::Edit => {
+                show_text_editor(ui, editor, editor_id);
+                // After the TextEdit: a click on 「編輯」 this frame would otherwise drop the focus again.
+                if !self.was_editing {
+                    ui.ctx().memory_mut(|memory| memory.request_focus(editor_id));
+                }
             }
         }
-        self.was_preview = self.is_preview;
+        self.was_editing = self.mode == ViewMode::Edit;
         if reload {
             editor.reload();
             self.clear_undo = true;
         }
-        if let Some(path) = linked {
+        if let Some(path) = restored {
+            // The copy of an old version is a new unsaved-to-git file; open it to edit.
+            self.mode = ViewMode::Edit;
+            self.after_save();
+            self.request_open(path);
+        } else if let Some(path) = linked {
             self.request_open(path);
         }
     }
@@ -597,7 +627,7 @@ impl NoteSyncApp {
             return;
         }
         if self.editor.as_mut().is_some_and(|e| e.autosave(Instant::now())) {
-            self.rescan();
+            self.after_save();
         }
     }
 
@@ -691,6 +721,7 @@ impl NoteSyncApp {
 
 impl eframe::App for NoteSyncApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.menus.backup_status.refresh(self.scheduler.last_report().as_ref());
         self.guard_close(ctx);
         self.handle_shortcuts(ctx);
         self.refresh_editor();
@@ -735,29 +766,6 @@ fn is_folder_open(collapsed: &HashSet<PathBuf>, folder: &Path, is_searching: boo
     is_searching || !collapsed.contains(folder)
 }
 
-pub fn cjk_font_bytes() -> Option<Vec<u8>> {
-    CJK_FONT_CANDIDATES
-        .iter()
-        .find_map(|path| fs::read(path).ok())
-}
-
-fn choose_folder() -> Result<Option<PathBuf>, String> {
-    let output = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg("POSIX path of (choose folder with prompt \"選擇筆記資料夾\")")
-        .output()
-        .map_err(|err| format!("無法開啟選擇視窗：{err}"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let text = String::from_utf8(output.stdout).map_err(|err| err.to_string())?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(PathBuf::from(trimmed)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,12 +779,4 @@ mod tests {
         assert!(is_folder_open(&HashSet::new(), &notes, false));
     }
 
-    #[test]
-    fn cjk_fallback_font_is_on_this_mac() {
-        if !cfg!(target_os = "macos") {
-            return;
-        }
-        let bytes = cjk_font_bytes().expect("system CJK font");
-        assert!(bytes.len() > 1000);
-    }
 }
