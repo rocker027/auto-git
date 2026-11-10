@@ -4,14 +4,16 @@ Lightweight macOS menu-bar tool for Markdown note folders:
 
 - Watch multiple folders and periodically `git add` + `git commit` (`update N files`)
 - `git init` when a folder is not a repo
-- Search notes via external [`qmd`](https://github.com/tobi/qmd) (`qmd search`)
-- Open one file at a time for read/edit; unsaved edits pause auto-commit
+- Left: every Markdown note in the watched folders, newest first; the search box filters by name and text as you type
+- Optional: with [`qmd`](https://github.com/tobi/qmd) on PATH, matching notes from other qmd collections appear under 「其他地方」
+- Right: one note open for editing; ⌘S saves. Unsaved edits pause auto-commit, and switching notes or closing the window asks before dropping them
+- The line above the search box tells whether everything is backed up; `⋯` holds 立即備份, pause, add and remove folder
 
 ## Requirements
 
 - Rust toolchain
 - `git` on PATH
-- `qmd` on PATH (optional for search)
+- `qmd` on PATH (optional; the built-in note list search works without it)
 
 ## Run
 

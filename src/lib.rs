@@ -1,5 +1,11 @@
 pub mod app_ui;
 pub mod config;
+pub mod editor;
+pub mod extra_search;
 pub mod git_ops;
+pub mod labels;
+pub mod notes;
 pub mod qmd_ops;
 pub mod scheduler;
+pub mod status;
+pub mod widgets;

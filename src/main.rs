@@ -1,14 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
-use note_sync::app_ui::NoteSyncApp;
+use note_sync::app_ui::{NoteSyncApp, SystemMenus};
 use note_sync::config::AppConfig;
 use note_sync::scheduler::Scheduler;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::accelerator::{Accelerator, Code, Modifiers};
+use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIconBuilder};
 
 fn main() -> eframe::Result {
@@ -21,8 +22,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([720.0, 480.0])
+            .with_inner_size([1000.0, 680.0])
+            .with_min_inner_size([640.0, 420.0])
             .with_title("Note Sync"),
         ..Default::default()
     };
@@ -49,18 +50,54 @@ fn main() -> eframe::Result {
             *tray_c.borrow_mut() = tray;
 
             install_cjk_fallback(&cc.egui_ctx);
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            let app = NoteSyncApp::new(
-                config,
-                dirty_editor,
-                scheduler,
-                tray_c.borrow_mut().take(),
+            note_sync::widgets::apply_style(&cc.egui_ctx);
+            let (app_menu, app_quit) = make_app_menu();
+            let menus = SystemMenus {
+                tray: tray_c.borrow_mut().take(),
                 show_item,
-                quit_item,
-            );
+                quit_items: vec![quit_item, app_quit],
+                app_menu,
+            };
+            let app = NoteSyncApp::new(config, dirty_editor, scheduler, menus);
             Ok(Box::new(app))
         }),
     )
+}
+
+/// Replaces winit's default app menu, whose Quit ends the app without asking
+/// about unsaved text. Our ⌘Q item is handled like the tray "結束".
+fn make_app_menu() -> (Option<Menu>, MenuItem) {
+    let quit = MenuItem::new(
+        "結束 Note Sync",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyQ)),
+    );
+    if !cfg!(target_os = "macos") {
+        return (None, quit);
+    }
+    let app = Submenu::with_items(
+        "Note Sync",
+        true,
+        &[
+            &PredefinedMenuItem::hide(None),
+            &PredefinedMenuItem::hide_others(None),
+            &PredefinedMenuItem::show_all(None),
+            &PredefinedMenuItem::separator(),
+            &quit,
+        ],
+    );
+    let menu = Menu::new();
+    match app.and_then(|app| menu.append(&app)) {
+        Ok(()) => {
+            #[cfg(target_os = "macos")]
+            menu.init_for_nsapp();
+            (Some(menu), quit)
+        }
+        Err(err) => {
+            eprintln!("note-sync: app menu not installed, ⌘Q will not ask about unsaved text: {err}");
+            (None, quit)
+        }
+    }
 }
 
 fn install_cjk_fallback(ctx: &egui::Context) {

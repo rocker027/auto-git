@@ -1,41 +1,68 @@
+//! Main window: note list on the left, the open note on the right.
+
 use crate::config::AppConfig;
-use crate::git_ops::{self, CommitOutcome};
-use crate::qmd_ops::{self, SearchHit};
+use crate::editor::OpenNote;
+use crate::labels::{folder_label, hit_label};
+use crate::extra_search::{ExtraSearch, QmdSettings};
+use crate::notes::{self, FolderNotes};
+use crate::qmd_ops::SearchHit;
 use crate::scheduler::Scheduler;
-use eframe::egui;
+use crate::status::{self, BackupState, Tone};
+use crate::widgets;
+use eframe::egui::{self, Id, RichText};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 const CJK_FONT_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     "/Library/Fonts/Arial Unicode.ttf",
 ];
+const RESCAN_EVERY: Duration = Duration::from_secs(10);
+const SEARCH_ID: &str = "note-search";
+
+/// Something waiting on the "save first?" question.
+enum Pending {
+    Open(PathBuf),
+    Close,
+}
+
+enum Choice {
+    Save,
+    Discard,
+    Cancel,
+}
 
 pub struct NoteSyncApp {
     config: Arc<Mutex<AppConfig>>,
     scheduler: Scheduler,
     dirty_editor: Arc<AtomicBool>,
-    search_query: String,
-    search_hits: Vec<SearchHit>,
-    search_error: String,
-    searched: bool,
-    open_path: Option<PathBuf>,
-    editor_text: String,
-    disk_fingerprint: u64,
-    disk_conflict: bool,
-    just_saved: bool,
-    editor_notice: String,
-    folder_notice: String,
-    backup_notice: String,
-    seen_scheduler: String,
-    show_id: tray_icon::menu::MenuId,
-    quit_id: tray_icon::menu::MenuId,
-    _tray: Option<tray_icon::TrayIcon>,
-    _show_item: tray_icon::menu::MenuItem,
-    _quit_item: tray_icon::menu::MenuItem,
+    library: Vec<FolderNotes>,
+    scan: Option<Receiver<Vec<FolderNotes>>>,
+    rescan_queued: bool,
+    last_scan: Instant,
+    query: String,
+    extra: ExtraSearch,
+    editor: Option<OpenNote>,
+    open_error: String,
+    folder_error: String,
+    pending: Option<Pending>,
+    may_close: bool,
+    /// The editor text was just (re)loaded; old undo steps must not come back.
+    clear_undo: bool,
+    menus: SystemMenus,
+}
+
+/// Tray menu and app menu. Kept alive here so the system keeps showing them.
+pub struct SystemMenus {
+    pub tray: Option<tray_icon::TrayIcon>,
+    pub show_item: tray_icon::menu::MenuItem,
+    /// Tray "結束" and the app menu's ⌘Q item; both go through the unsaved-text check.
+    pub quit_items: Vec<tray_icon::menu::MenuItem>,
+    pub app_menu: Option<tray_icon::menu::Menu>,
 }
 
 impl NoteSyncApp {
@@ -43,428 +70,621 @@ impl NoteSyncApp {
         config: Arc<Mutex<AppConfig>>,
         dirty_editor: Arc<AtomicBool>,
         scheduler: Scheduler,
-        tray: Option<tray_icon::TrayIcon>,
-        show_item: tray_icon::menu::MenuItem,
-        quit_item: tray_icon::menu::MenuItem,
+        menus: SystemMenus,
     ) -> Self {
-        let show_id = show_item.id().clone();
-        let quit_id = quit_item.id().clone();
-        Self {
+        let mut app = Self {
             config,
             scheduler,
             dirty_editor,
-            search_query: String::new(),
-            search_hits: Vec::new(),
-            search_error: String::new(),
-            searched: false,
-            open_path: None,
-            editor_text: String::new(),
-            disk_fingerprint: 0,
-            disk_conflict: false,
-            just_saved: false,
-            editor_notice: String::new(),
-            folder_notice: String::new(),
-            backup_notice: String::new(),
-            seen_scheduler: String::new(),
-            show_id,
-            quit_id,
-            _tray: tray,
-            _show_item: show_item,
-            _quit_item: quit_item,
-        }
+            library: Vec::new(),
+            scan: None,
+            rescan_queued: false,
+            last_scan: Instant::now(),
+            query: String::new(),
+            extra: ExtraSearch::default(),
+            editor: None,
+            open_error: String::new(),
+            folder_error: String::new(),
+            pending: None,
+            may_close: false,
+            clear_undo: false,
+            menus,
+        };
+        app.rescan();
+        app
     }
 
-    fn mark_dirty(&self, dirty: bool) {
-        self.dirty_editor.store(dirty, Ordering::Relaxed);
+    fn folders(&self) -> Vec<PathBuf> {
+        self.config.lock().unwrap().folders.clone()
     }
 
-    fn is_dirty(&self) -> bool {
-        if let Some(path) = &self.open_path {
-            let on_disk = fs::read_to_string(path).unwrap_or_default();
-            return on_disk != self.editor_text;
-        }
-        false
+    fn editor_dirty(&self) -> bool {
+        self.editor.as_ref().is_some_and(OpenNote::is_dirty)
     }
 
-    fn has_folders(&self) -> bool {
-        !self.config.lock().unwrap().folders.is_empty()
-    }
+    // ---- notes library ------------------------------------------------------
 
-    fn run_search(&mut self) {
-        let query = self.search_query.trim().to_string();
-        if query.is_empty() {
-            self.search_hits.clear();
-            self.search_error.clear();
-            self.searched = false;
+    fn rescan(&mut self) {
+        if self.scan.is_some() {
+            self.rescan_queued = true;
             return;
         }
-        self.search_error.clear();
-        let (qmd, limit, collection) = {
-            let cfg = self.config.lock().unwrap();
-            (
-                cfg.qmd_path.clone(),
-                cfg.search_limit,
-                cfg.qmd_collection.clone(),
-            )
-        };
-        match qmd_ops::search(
-            &qmd,
-            &query,
-            limit,
-            collection.as_deref(),
-            Duration::from_secs(20),
-        ) {
-            Ok(hits) => {
-                self.search_hits = hits;
-                self.searched = true;
-            }
-            Err(err) => {
-                self.search_hits.clear();
-                self.search_error = err.to_string();
-                self.searched = true;
-            }
-        }
-    }
-
-    fn open_hit(&mut self, path: PathBuf) {
-        match fs::read_to_string(&path) {
-            Ok(text) => {
-                self.disk_fingerprint = fingerprint(&text);
-                self.editor_text = text;
-                self.open_path = Some(path);
-                self.disk_conflict = false;
-                self.just_saved = false;
-                self.editor_notice.clear();
-                self.mark_dirty(false);
-            }
-            Err(err) => self.editor_notice = err.to_string(),
-        }
-    }
-
-    fn save_open(&mut self) {
-        let Some(path) = self.open_path.clone() else {
-            return;
-        };
-        if let Ok(on_disk) = fs::read_to_string(&path) {
-            if fingerprint(&on_disk) != self.disk_fingerprint && on_disk != self.editor_text {
-                self.disk_conflict = true;
-                return;
-            }
-        }
-        match fs::write(&path, &self.editor_text) {
-            Ok(()) => {
-                self.disk_fingerprint = fingerprint(&self.editor_text);
-                self.disk_conflict = false;
-                self.just_saved = true;
-                self.editor_notice.clear();
-                self.mark_dirty(false);
-            }
-            Err(err) => self.editor_notice = err.to_string(),
-        }
-    }
-
-    fn reload_open(&mut self) {
-        let Some(path) = self.open_path.clone() else {
-            return;
-        };
-        match fs::read_to_string(&path) {
-            Ok(text) => {
-                self.disk_fingerprint = fingerprint(&text);
-                self.editor_text = text;
-                self.disk_conflict = false;
-                self.just_saved = false;
-                self.editor_notice.clear();
-                self.mark_dirty(false);
-            }
-            Err(err) => self.editor_notice = err.to_string(),
-        }
-    }
-
-    fn commit_now(&mut self) {
-        if self.is_dirty() || !self.has_folders() {
-            return;
-        }
-        let (folders, git, skip) = {
-            let cfg = self.config.lock().unwrap();
-            (
-                cfg.folders.clone(),
-                cfg.git_path.clone(),
-                cfg.skip_if_staged,
-            )
-        };
-        let mut errors = Vec::new();
-        let mut committed = false;
-        let mut blocked = false;
-        for folder in folders {
-            match git_ops::auto_commit(&git, &folder, skip) {
-                Ok(CommitOutcome::Committed { .. }) => committed = true,
-                Ok(CommitOutcome::SkippedNoChanges) => {}
-                Ok(CommitOutcome::SkippedStagedPresent | CommitOutcome::SkippedBusyState(_)) => {
-                    blocked = true;
-                }
-                Err(err) => errors.push(err.to_string()),
-            }
-        }
-        self.backup_notice = manual_backup_notice(committed, blocked, &errors);
-    }
-
-    fn add_folder(&mut self, path: PathBuf) {
-        if !path.is_dir() {
-            self.folder_notice = "這不是資料夾".into();
-            return;
-        }
-        let saved = {
-            let mut cfg = self.config.lock().unwrap();
-            cfg.add_folder(path);
-            cfg.save()
-        };
-        self.folder_notice = match saved {
-            Ok(()) => String::new(),
-            Err(err) => err.to_string(),
-        };
-    }
-
-    fn remove_saved_folder(&mut self, path: &Path) {
-        let saved = {
-            let mut cfg = self.config.lock().unwrap();
-            cfg.remove_folder(path);
-            cfg.save()
-        };
-        self.folder_notice = match saved {
-            Ok(()) => String::new(),
-            Err(err) => err.to_string(),
-        };
-    }
-
-    fn sync_backup_notice(&mut self) {
-        let raw = self.scheduler.status_message();
-        if raw == self.seen_scheduler {
-            return;
-        }
-        self.seen_scheduler = raw.clone();
-        if let Some(line) = backup_line(&raw) {
-            self.backup_notice = line;
-        }
-    }
-
-    fn handle_tray(&self, ctx: &egui::Context) {
-        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-            if event.id == self.show_id {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else if event.id == self.quit_id {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-    }
-
-    fn handle_save_shortcut(&mut self, ctx: &egui::Context) {
-        let pressed =
-            ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
-        if pressed && self.open_path.is_some() && !self.disk_conflict {
-            self.save_open();
-        }
-    }
-
-    fn show_search(&mut self, ui: &mut egui::Ui) {
-        let mut submit = false;
-        ui.horizontal(|ui| {
-            let field_width = (ui.available_width() - 56.0).max(40.0);
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.search_query)
-                    .hint_text("搜尋筆記")
-                    .desired_width(field_width),
-            );
-            let clicked = ui.button("搜尋").clicked();
-            let entered =
-                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            submit = clicked || entered;
+        let folders = self.folders();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(notes::scan(&folders));
         });
-        if submit {
-            self.run_search();
-        }
-        if !self.search_error.is_empty() {
-            ui.colored_label(ui.visuals().error_fg_color, &self.search_error);
-        }
+        self.scan = Some(receiver);
+        self.last_scan = Instant::now();
     }
 
-    fn show_hits(&mut self, ui: &mut egui::Ui) {
-        if !self.search_error.is_empty() {
-            return;
-        }
-        if self.searched && self.search_hits.is_empty() {
-            ui.label("沒有找到");
-            return;
-        }
-        let hits = self.search_hits.clone();
-        let mut chosen = None;
-        for hit in &hits {
-            let selected = self.open_path.as_ref() == Some(&hit.file);
-            let width = ui.available_width();
-            if ui
-                .add(
-                    egui::Button::new(hit_label(hit, &hits))
-                        .truncate()
-                        .selected(selected)
-                        .min_size(egui::vec2(width, 28.0)),
-                )
-                .clicked()
-            {
-                chosen = Some(hit.file.clone());
+    fn poll_library(&mut self) {
+        if let Some(receiver) = &self.scan {
+            match receiver.try_recv() {
+                Ok(library) => {
+                    self.library = library;
+                    self.scan = None;
+                    self.last_scan = Instant::now();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.scan = None,
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        if let Some(path) = chosen {
-            self.open_hit(path);
+        if self.scan.is_none() && (self.rescan_queued || self.last_scan.elapsed() > RESCAN_EVERY) {
+            self.rescan_queued = false;
+            self.rescan();
         }
     }
 
-    fn show_folders(&mut self, ui: &mut egui::Ui) {
-        let folders = self.config.lock().unwrap().folders.clone();
-        let mut remove_path = None;
-        for folder in &folders {
-            ui.horizontal(|ui| {
-                ui.label(folder_label(folder, &folders));
-                if ui.button("移除").clicked() {
-                    remove_path = Some(folder.clone());
-                }
-            });
-        }
-        if ui.button("加入資料夾").clicked() {
-            self.pick_and_add_folder();
-        }
-        if let Some(path) = remove_path {
-            self.remove_saved_folder(&path);
-        }
-        if !self.folder_notice.is_empty() {
-            ui.colored_label(ui.visuals().error_fg_color, &self.folder_notice);
-        }
+    fn is_in_library(&self, path: &Path) -> bool {
+        self.library
+            .iter()
+            .any(|folder| folder.notes.iter().any(|note| note.path == path))
     }
+
+    // ---- folders ------------------------------------------------------------
 
     fn pick_and_add_folder(&mut self) {
         match choose_folder() {
             Ok(Some(path)) => self.add_folder(path),
             Ok(None) => {}
-            Err(message) => self.folder_notice = message,
+            Err(message) => self.folder_error = message,
         }
     }
 
-    fn show_backup(&mut self, ui: &mut egui::Ui) {
-        let pause_label = if self.scheduler.is_paused() {
-            "繼續備份"
-        } else {
-            "暫停備份"
+    fn add_folder(&mut self, path: PathBuf) {
+        if !path.is_dir() {
+            self.folder_error = "這不是資料夾".into();
+            return;
+        }
+        self.update_folders(|cfg| cfg.add_folder(path));
+        if !self.scheduler.is_paused() {
+            self.scheduler.request_now();
+        }
+    }
+
+    fn remove_folder(&mut self, path: &Path) {
+        self.update_folders(|cfg| cfg.remove_folder(path));
+    }
+
+    fn update_folders(&mut self, change: impl FnOnce(&mut AppConfig)) {
+        let saved = {
+            let mut cfg = self.config.lock().unwrap();
+            change(&mut cfg);
+            cfg.save()
         };
-        let can_backup = !self.is_dirty() && self.has_folders();
-        let mut toggle_pause = false;
-        let mut backup_now = false;
-        ui.horizontal(|ui| {
-            toggle_pause = ui.small_button(pause_label).clicked();
-            backup_now = ui
-                .add_enabled(can_backup, egui::Button::new("現在備份").small())
-                .clicked();
-        });
-        if toggle_pause {
-            self.scheduler.set_paused(!self.scheduler.is_paused());
-        }
-        if backup_now {
-            self.commit_now();
-        }
-        show_backup_notice(ui, &self.backup_notice);
+        self.folder_error = match saved {
+            Ok(()) => String::new(),
+            Err(err) => format!("無法儲存設定：{err}"),
+        };
+        self.rescan();
     }
 
-    fn show_editor(&mut self, ui: &mut egui::Ui) {
-        let Some(path) = self.open_path.clone() else {
-            if !self.editor_notice.is_empty() {
-                ui.colored_label(ui.visuals().error_fg_color, &self.editor_notice);
+    // ---- editor -------------------------------------------------------------
+
+    fn request_open(&mut self, path: PathBuf) {
+        let same = self.editor.as_ref().is_some_and(|e| e.path == path);
+        if same {
+            return;
+        }
+        if self.editor_dirty() {
+            self.pending = Some(Pending::Open(path));
+        } else {
+            self.open(&path);
+        }
+    }
+
+    fn open(&mut self, path: &Path) {
+        match OpenNote::load(path) {
+            Ok(note) => {
+                self.editor = Some(note);
+                self.open_error.clear();
+                self.clear_undo = true;
             }
+            Err(err) => self.open_error = format!("打不開「{}」：{err}", notes::note_title(path)),
+        }
+    }
+
+    fn save(&mut self) -> bool {
+        let saved = self.editor.as_mut().is_some_and(OpenNote::save);
+        if saved {
+            self.rescan();
+        }
+        saved
+    }
+
+    fn resolve_pending(&mut self, choice: Choice, ctx: &egui::Context) {
+        let Some(pending) = self.pending.take() else {
             return;
         };
-        self.show_editor_header(ui, &path);
-        if !self.editor_notice.is_empty() {
-            ui.colored_label(ui.visuals().error_fg_color, &self.editor_notice);
+        let go_on = match choice {
+            Choice::Cancel => false,
+            Choice::Save => self.save(),
+            Choice::Discard => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.reload();
+                }
+                self.clear_undo = true;
+                true
+            }
+        };
+        if !go_on {
+            return;
         }
-        egui::ScrollArea::both().show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut self.editor_text)
-                    .code_editor()
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(40),
-            );
+        match pending {
+            Pending::Open(path) => self.open(&path),
+            Pending::Close => {
+                self.may_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    // ---- window events ------------------------------------------------------
+
+    fn handle_tray(&self, ctx: &egui::Context) {
+        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            if event.id == *self.menus.show_item.id() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            } else if self.menus.quit_items.iter().any(|item| item.id() == &event.id) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// Unsaved text must never vanish with the window.
+    fn guard_close(&mut self, ctx: &egui::Context) {
+        let asked = ctx.input(|input| input.viewport().close_requested());
+        if asked && !self.may_close && self.editor_dirty() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending = Some(Pending::Close);
+        }
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let (save, find) = ctx.input_mut(|input| {
+            (
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::F),
+            )
+        });
+        let can_save = self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.is_dirty() && !e.has_conflict);
+        if save && can_save {
+            self.save();
+        }
+        if find {
+            ctx.memory_mut(|memory| memory.request_focus(Id::new(SEARCH_ID)));
+        }
+    }
+
+    // ---- sidebar ------------------------------------------------------------
+
+    fn show_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        self.show_status_row(ui);
+        ui.add_space(4.0);
+        self.show_search_field(ui);
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.show_note_list(ui));
+    }
+
+    fn show_status_row(&mut self, ui: &mut egui::Ui) {
+        let report = self.scheduler.last_report();
+        let state = BackupState {
+            report: report.as_ref(),
+            is_running: self.scheduler.is_running(),
+            is_paused: self.scheduler.is_paused(),
+            editor_dirty: self.editor_dirty(),
+        };
+        let line = status::backup_status(&state, SystemTime::now());
+        let is_problem = line.tone == Tone::Problem;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.show_main_menu(ui);
+                let color = match line.tone {
+                    Tone::Good => ui.visuals().text_color(),
+                    Tone::Quiet => ui.visuals().weak_text_color(),
+                    Tone::Problem => ui.visuals().error_fg_color,
+                };
+                if !is_problem {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new(&line.text).color(color)).truncate());
+                    });
+                }
+            });
+        });
+        // Problems get their own wrapped line so the cause is never cut off.
+        if is_problem {
+            let label = ui.add(egui::Label::new(RichText::new(&line.text).color(ui.visuals().error_fg_color)).wrap());
+            if let Some(detail) = &line.detail {
+                label.on_hover_text(detail);
+            }
+        }
+    }
+
+    fn show_main_menu(&mut self, ui: &mut egui::Ui) {
+        let can_back_up =
+            !self.editor_dirty() && !self.scheduler.is_running() && !self.folders().is_empty();
+        ui.menu_button(RichText::new("⋯").size(18.0), |ui| {
+            if ui.add_enabled(can_back_up, egui::Button::new("立即備份")).clicked() {
+                self.scheduler.request_now();
+                ui.close_menu();
+            }
+            let paused = self.scheduler.is_paused();
+            let pause_text = if paused { "繼續自動備份" } else { "暫停自動備份" };
+            if ui.button(pause_text).clicked() {
+                self.scheduler.set_paused(!paused);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("加入資料夾…").clicked() {
+                ui.close_menu();
+                self.pick_and_add_folder();
+            }
+            self.show_remove_menu(ui);
         });
     }
 
-    fn show_editor_header(&mut self, ui: &mut egui::Ui, path: &Path) {
-        let conflict = self.disk_conflict;
-        let dirty = self.is_dirty();
-        let just_saved = self.just_saved;
-        let mut reload = false;
-        let mut save = false;
-        ui.horizontal(|ui| {
-            ui.strong(file_name(path));
-            show_editor_mark(ui, conflict, dirty, just_saved);
-            if conflict {
-                reload = ui.button("捨棄修改並重新載入").clicked();
-            } else {
-                save = ui.button("儲存").clicked();
-            }
+    fn show_remove_menu(&mut self, ui: &mut egui::Ui) {
+        let folders = self.folders();
+        let mut removed = None;
+        ui.add_enabled_ui(!folders.is_empty(), |ui| {
+            ui.menu_button("移除資料夾", |ui| {
+                for folder in &folders {
+                    if ui.button(folder_label(folder, &folders)).clicked() {
+                        removed = Some(folder.clone());
+                        ui.close_menu();
+                    }
+                }
+            });
         });
+        if let Some(folder) = removed {
+            self.remove_folder(&folder);
+        }
+    }
+
+    fn show_search_field(&mut self, ui: &mut egui::Ui) {
+        let field = egui::TextEdit::singleline(&mut self.query)
+            .id(Id::new(SEARCH_ID))
+            .hint_text("🔍 搜尋")
+            .margin(egui::vec2(8.0, 6.0))
+            .desired_width(f32::INFINITY);
+        let response = ui.add(field);
+        if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.query.clear();
+        }
+        self.extra.set_query(&self.query);
+    }
+
+    fn show_note_list(&mut self, ui: &mut egui::Ui) {
+        let folders = self.folders();
+        let query = self.query.trim().to_string();
+        let words = notes::search_words(&query);
+        let mut chosen = None;
+        let mut removed = None;
+        let mut shown = 0;
+        for group in &self.library {
+            let matching: Vec<_> = group
+                .notes
+                .iter()
+                .filter(|note| notes::matches(note, &words))
+                .collect();
+            if !query.is_empty() && matching.is_empty() {
+                continue;
+            }
+            shown += matching.len();
+            let header = folder_header(ui, &group.folder, &folders);
+            header.context_menu(|ui| {
+                if ui.button("移除這個資料夾").clicked() {
+                    removed = Some(group.folder.clone());
+                    ui.close_menu();
+                }
+            });
+            if !group.exists {
+                ui.colored_label(ui.visuals().error_fg_color, "  找不到這個資料夾");
+            }
+            for note in matching {
+                if self.note_row(ui, &note.path, &note.title, note.modified) {
+                    chosen = Some(note.path.clone());
+                }
+            }
+            ui.add_space(10.0);
+        }
+        shown += self.show_extra_hits(ui, &mut chosen);
+        self.show_list_footer(ui, &query, shown);
+        if let Some(path) = chosen {
+            self.request_open(path);
+        }
+        if let Some(folder) = removed {
+            self.remove_folder(&folder);
+        }
+    }
+
+    /// Returns true when clicked.
+    fn note_row(
+        &self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        title: &str,
+        modified: Option<SystemTime>,
+    ) -> bool {
+        let open = self.editor.as_ref().filter(|e| e.path == path);
+        let title = match open {
+            Some(editor) if editor.is_dirty() => format!("● {title}"),
+            _ => title.to_string(),
+        };
+        let meta = modified
+            .and_then(|at| SystemTime::now().duration_since(at).ok())
+            .map(status::time_ago)
+            .unwrap_or_default();
+        let row = widgets::note_row(ui, &title, &meta, open.is_some());
+        row.on_hover_text(path.display().to_string()).clicked()
+    }
+
+    fn show_extra_hits(&self, ui: &mut egui::Ui, chosen: &mut Option<PathBuf>) -> usize {
+        let hits: Vec<&SearchHit> = self
+            .extra
+            .hits()
+            .iter()
+            .filter(|hit| !self.is_in_library(&hit.file))
+            .collect();
+        if hits.is_empty() {
+            return 0;
+        }
+        ui.label(RichText::new("其他地方").small().strong().weak());
+        let all: Vec<SearchHit> = hits.iter().map(|hit| (*hit).clone()).collect();
+        for hit in &hits {
+            if self.note_row(ui, &hit.file, &hit_label(hit, &all), None) {
+                *chosen = Some(hit.file.clone());
+            }
+        }
+        hits.len()
+    }
+
+    fn show_list_footer(&mut self, ui: &mut egui::Ui, query: &str, shown: usize) {
+        if !query.is_empty() && shown == 0 && !self.extra.is_busy() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| ui.weak("沒有符合的筆記"));
+        }
+        if let Some(failure) = &self.extra.failure {
+            ui.weak("其他地方的搜尋失敗").on_hover_text(failure);
+        }
+        if query.is_empty() {
+            ui.add_space(4.0);
+            if ui.button("＋ 加入資料夾").clicked() {
+                self.pick_and_add_folder();
+            }
+        }
+        if !self.folder_error.is_empty() {
+            ui.colored_label(ui.visuals().error_fg_color, &self.folder_error);
+        }
+    }
+
+    // ---- editor panel -------------------------------------------------------
+
+    fn show_editor(&mut self, ui: &mut egui::Ui) {
+        if !self.open_error.is_empty() {
+            ui.colored_label(ui.visuals().error_fg_color, &self.open_error);
+        }
+        let clear_undo = std::mem::take(&mut self.clear_undo);
+        let Some(editor) = self.editor.as_mut() else {
+            ui.centered_and_justified(|ui| ui.weak("← 選一則筆記"));
+            return;
+        };
+        let mut save = false;
+        let mut reload = false;
+        show_editor_header(ui, editor, &mut save);
+        if editor.has_conflict {
+            reload = show_conflict_banner(ui);
+        }
+        let editor_id = Id::new(("note-editor", &editor.path));
+        if clear_undo {
+            forget_undo(ui.ctx(), editor_id);
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_sized(
+                    ui.available_size(),
+                    egui::TextEdit::multiline(&mut editor.text)
+                        .id(editor_id)
+                        .lock_focus(true)
+                        .frame(false)
+                        .font(egui::FontId::proportional(16.0)),
+                );
+            });
         if reload {
-            self.reload_open();
+            editor.reload();
+            self.clear_undo = true;
         }
         if save {
-            self.save_open();
+            self.save();
         }
     }
-}
 
-fn show_editor_mark(ui: &mut egui::Ui, conflict: bool, dirty: bool, just_saved: bool) {
-    if conflict {
-        ui.colored_label(ui.visuals().error_fg_color, "檔案已被改過");
-        return;
+    // ---- first run ----------------------------------------------------------
+
+    fn show_welcome(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() / 2.0 - 60.0).max(24.0));
+            let button =
+                widgets::primary_button(ui, "選擇筆記資料夾", 18.0).min_size(egui::vec2(240.0, 52.0));
+            if ui.add(button).clicked() {
+                self.pick_and_add_folder();
+            }
+            if !self.folder_error.is_empty() {
+                ui.add_space(8.0);
+                ui.colored_label(ui.visuals().error_fg_color, &self.folder_error);
+            }
+        });
     }
-    if dirty {
-        ui.colored_label(ui.visuals().warn_fg_color, "未儲存");
-        return;
+
+    fn show_unsaved_dialog(&mut self, ctx: &egui::Context) {
+        if self.pending.is_none() {
+            return;
+        }
+        let title = self
+            .editor
+            .as_ref()
+            .map(|e| notes::note_title(&e.path))
+            .unwrap_or_default();
+        let mut choice = None;
+        let modal = egui::Modal::new(Id::new("unsaved")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.heading(format!("要儲存「{title}」嗎？"));
+            ui.add_space(16.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(widgets::primary_button(ui, "儲存", 15.0)).clicked() {
+                    choice = Some(Choice::Save);
+                }
+                if ui.button("不儲存").clicked() {
+                    choice = Some(Choice::Discard);
+                }
+                if ui.button("取消").clicked() {
+                    choice = Some(Choice::Cancel);
+                }
+            });
+        });
+        if modal.should_close() && choice.is_none() {
+            choice = Some(Choice::Cancel);
+        }
+        if let Some(choice) = choice {
+            self.resolve_pending(choice, ctx);
+        }
     }
-    if just_saved {
-        ui.label("已儲存");
+
+    fn refresh_editor(&mut self) {
+        if self.editor.as_mut().is_some_and(OpenNote::poll_disk) {
+            self.clear_undo = true;
+        }
+        self.dirty_editor.store(self.editor_dirty(), Ordering::Relaxed);
+    }
+
+    fn tick_extra_search(&mut self) {
+        let config = self.config.clone();
+        self.extra.tick(|| {
+            let cfg = config.lock().unwrap();
+            QmdSettings {
+                qmd: cfg.qmd_path.clone(),
+                limit: cfg.search_limit,
+                collection: cfg.qmd_collection.clone(),
+            }
+        });
     }
 }
 
 impl eframe::App for NoteSyncApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.is_dirty() {
-            self.just_saved = false;
-        }
-        self.mark_dirty(self.is_dirty());
-        self.sync_backup_notice();
-        self.handle_save_shortcut(ctx);
         self.handle_tray(ctx);
+        self.guard_close(ctx);
+        self.handle_shortcuts(ctx);
+        self.refresh_editor();
+        self.poll_library();
+        self.tick_extra_search();
 
-        egui::SidePanel::left("notes")
-            .resizable(true)
-            .default_width(280.0)
-            .show(ctx, |ui| {
-                self.show_search(ui);
-                if self.searched {
-                    egui::ScrollArea::vertical()
-                        .max_height((ui.available_height() - 120.0).max(80.0))
-                        .show(ui, |ui| {
-                            self.show_hits(ui);
-                        });
-                    ui.separator();
-                }
-                self.show_folders(ui);
-                ui.separator();
-                self.show_backup(ui);
-            });
+        if self.folders().is_empty() {
+            egui::CentralPanel::default().show(ctx, |ui| self.show_welcome(ui));
+        } else {
+            egui::SidePanel::left("notes")
+                .resizable(true)
+                .default_width(300.0)
+                .width_range(220.0..=520.0)
+                .show(ctx, |ui| self.show_sidebar(ui));
+            egui::CentralPanel::default()
+                .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(24.0))
+                .show(ctx, |ui| self.show_editor(ui));
+        }
+        self.show_unsaved_dialog(ctx);
+        self.dirty_editor.store(self.editor_dirty(), Ordering::Relaxed);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.show_editor(ui);
-        });
-
-        ctx.request_repaint_after(Duration::from_secs(1));
+        let waiting = self.scan.is_some() || self.extra.is_busy() || self.scheduler.is_running();
+        let next = if waiting { 200 } else { 1000 };
+        ctx.request_repaint_after(Duration::from_millis(next));
     }
+}
+
+fn show_editor_header(ui: &mut egui::Ui, editor: &OpenNote, save: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if editor.is_dirty() {
+                let button = widgets::primary_button(ui, "儲存", 15.0).shortcut_text("⌘S");
+                *save = ui.add_enabled(!editor.has_conflict, button).clicked();
+            } else {
+                ui.weak("✓ 已儲存");
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(notes::note_title(&editor.path)).heading()).truncate())
+                    .on_hover_text(editor.path.display().to_string());
+            });
+        });
+    });
+    if !editor.error.is_empty() {
+        ui.colored_label(ui.visuals().error_fg_color, &editor.error);
+    }
+    ui.add_space(8.0);
+}
+
+/// Returns true when the user takes the version from disk.
+fn show_conflict_banner(ui: &mut egui::Ui) -> bool {
+    let mut reload = false;
+    egui::Frame::new()
+        .fill(ui.visuals().warn_fg_color.gamma_multiply(0.15))
+        .corner_radius(6.0)
+        .inner_margin(10.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("⚠ 這則筆記在別的地方被改過了");
+                reload = ui.button("改用最新版本").clicked();
+            });
+        });
+    ui.add_space(8.0);
+    reload
+}
+
+fn forget_undo(ctx: &egui::Context, id: Id) {
+    if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
+        state.clear_undoer();
+        state.store(ctx, id);
+    }
+}
+
+fn folder_header(ui: &mut egui::Ui, folder: &Path, folders: &[PathBuf]) -> egui::Response {
+    ui.add(
+        egui::Label::new(
+            RichText::new(folder_label(folder, folders))
+                .small()
+                .strong()
+                .color(ui.visuals().weak_text_color()),
+        )
+        .sense(egui::Sense::click()),
+    )
+    .on_hover_text(folder.display().to_string())
 }
 
 pub fn cjk_font_bytes() -> Option<Vec<u8>> {
@@ -478,7 +698,7 @@ fn choose_folder() -> Result<Option<PathBuf>, String> {
         .arg("-e")
         .arg("POSIX path of (choose folder with prompt \"選擇筆記資料夾\")")
         .output()
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format!("無法開啟選擇視窗：{err}"))?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -490,169 +710,9 @@ fn choose_folder() -> Result<Option<PathBuf>, String> {
     Ok(Some(PathBuf::from(trimmed)))
 }
 
-fn backup_line(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "no folders configured" {
-        return None;
-    }
-    let parts: Vec<&str> = trimmed.split(" | ").collect();
-    let failed: Vec<&str> = parts
-        .iter()
-        .copied()
-        .filter(|part| part.contains(": error") || part.contains(": missing"))
-        .collect();
-    if !failed.is_empty() {
-        return Some(failed.join(" | "));
-    }
-    if parts.iter().any(|part| part.contains("skipped (")) {
-        return Some("這次沒有備份".into());
-    }
-    if parts.iter().any(|part| part.contains("update ")) {
-        return Some("已備份".into());
-    }
-    None
-}
-
-fn manual_backup_notice(committed: bool, blocked: bool, errors: &[String]) -> String {
-    if !errors.is_empty() {
-        return errors.join(" | ");
-    }
-    if blocked {
-        return "這次沒有備份".into();
-    }
-    if committed {
-        return "已備份".into();
-    }
-    "沒有新內容".into()
-}
-
-fn folder_label(path: &Path, folders: &[PathBuf]) -> String {
-    let name = file_name(path);
-    let shared = folders
-        .iter()
-        .filter(|other| other.file_name() == path.file_name())
-        .count()
-        > 1;
-    match path.parent().and_then(Path::file_name) {
-        Some(parent) if shared => format!("{}/{}", parent.to_string_lossy(), name),
-        _ => name,
-    }
-}
-
-fn hit_label(hit: &SearchHit, hits: &[SearchHit]) -> String {
-    let name = file_name(&hit.file);
-    let title = hit
-        .title
-        .as_deref()
-        .map(single_line)
-        .filter(|title| !title.is_empty());
-    let Some(title) = title else {
-        return name;
-    };
-    let shared = hits
-        .iter()
-        .filter(|other| other.title.as_deref().map(single_line).as_deref() == Some(title.as_str()))
-        .count()
-        > 1;
-    if shared {
-        format!("{title} · {name}")
-    } else {
-        title
-    }
-}
-
-fn single_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
-}
-
-fn fingerprint(text: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn show_backup_notice(ui: &mut egui::Ui, notice: &str) {
-    if notice.is_empty() {
-        return;
-    }
-    let failure = notice != "已備份" && notice != "沒有新內容";
-    if failure {
-        ui.colored_label(ui.visuals().error_fg_color, notice);
-    } else {
-        ui.label(notice);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn quiet_backup_lines_stay_hidden() {
-        assert_eq!(backup_line(""), None);
-        assert_eq!(backup_line("no folders configured"), None);
-        assert_eq!(backup_line("/notes: no changes"), None);
-    }
-
-    #[test]
-    fn blocked_backup_is_not_called_empty() {
-        assert_eq!(
-            backup_line("/a: no changes | /b: skipped (staged)"),
-            Some("這次沒有備份".into())
-        );
-        assert_eq!(manual_backup_notice(false, true, &[]), "這次沒有備份");
-        assert_eq!(manual_backup_notice(true, true, &[]), "這次沒有備份");
-        assert_eq!(manual_backup_notice(false, false, &[]), "沒有新內容");
-        assert_eq!(manual_backup_notice(true, false, &[]), "已備份");
-    }
-
-    #[test]
-    fn commit_backup_line_is_short() {
-        assert_eq!(
-            backup_line("/notes: update 2 files (2)"),
-            Some("已備份".into())
-        );
-    }
-
-    #[test]
-    fn failed_backup_line_keeps_the_cause() {
-        let raw = "/notes: error git add failed";
-        assert_eq!(backup_line(raw), Some(raw.to_string()));
-        assert_eq!(backup_line("/gone: missing"), Some("/gone: missing".into()));
-    }
-
-    #[test]
-    fn folder_label_uses_the_name_until_names_collide() {
-        let notes = PathBuf::from("/Users/a/Notes");
-        let work = PathBuf::from("/Users/a/Work");
-        assert_eq!(folder_label(&notes, &[notes.clone(), work]), "Notes");
-        let other = PathBuf::from("/Users/b/Notes");
-        assert_eq!(folder_label(&notes, &[notes.clone(), other]), "a/Notes");
-    }
-
-    #[test]
-    fn hit_label_hides_the_path_until_titles_collide() {
-        let daily = sample_hit("/notes/daily.md", Some("日記"));
-        let other = sample_hit("/notes/other.md", Some("待辦"));
-        assert_eq!(hit_label(&daily, &[daily.clone(), other]), "日記");
-        let same = sample_hit("/work/daily.md", Some("日記"));
-        assert_eq!(hit_label(&daily, &[daily.clone(), same]), "日記 · daily.md");
-        let untitled = sample_hit("/notes/loose.md", None);
-        assert_eq!(hit_label(&untitled, &[untitled.clone()]), "loose.md");
-        let wrapped = sample_hit("/notes/intent.md", Some("Intent — 第 2 批\n；下一行不換行"));
-        assert_eq!(
-            hit_label(&wrapped, &[wrapped.clone()]),
-            "Intent — 第 2 批 ；下一行不換行"
-        );
-    }
 
     #[test]
     fn cjk_fallback_font_is_on_this_mac() {
@@ -661,14 +721,5 @@ mod tests {
         }
         let bytes = cjk_font_bytes().expect("system CJK font");
         assert!(bytes.len() > 1000);
-    }
-
-    fn sample_hit(file: &str, title: Option<&str>) -> SearchHit {
-        SearchHit {
-            file: PathBuf::from(file),
-            title: title.map(str::to_string),
-            snippet: None,
-            score: None,
-        }
     }
 }
