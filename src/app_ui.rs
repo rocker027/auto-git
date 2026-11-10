@@ -444,7 +444,7 @@ impl NoteSyncApp {
             .map(status::time_ago)
             .unwrap_or_default();
         let row = widgets::note_row(ui, &title, &meta, open.is_some());
-        row.on_hover_text(path.display().to_string()).clicked()
+        row.clicked()
     }
 
     fn show_extra_hits(&self, ui: &mut egui::Ui, chosen: &mut Option<PathBuf>) -> usize {
@@ -684,7 +684,6 @@ fn folder_header(ui: &mut egui::Ui, folder: &Path, folders: &[PathBuf]) -> egui:
         )
         .sense(egui::Sense::click()),
     )
-    .on_hover_text(folder.display().to_string())
 }
 
 pub fn cjk_font_bytes() -> Option<Vec<u8>> {
