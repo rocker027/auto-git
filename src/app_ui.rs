@@ -9,7 +9,8 @@ use crate::qmd_ops::SearchHit;
 use crate::scheduler::Scheduler;
 use crate::status::{self, BackupState, Tone};
 use crate::editor_view::{
-    forget_undo, show_conflict_banner, show_editor_header, show_preview, show_text_editor,
+    forget_undo, resolve_note_link, show_conflict_banner, show_editor_header, show_preview,
+    show_text_editor,
 };
 use crate::widgets;
 use eframe::egui::{self, Id, RichText};
@@ -59,6 +60,8 @@ pub struct NoteSyncApp {
     collapsed: HashSet<PathBuf>,
     /// Show the open note as rendered Markdown instead of the editor.
     is_preview: bool,
+    /// Preview state of the previous frame, to give the editor its focus back.
+    was_preview: bool,
     markdown_cache: egui_commonmark::CommonMarkCache,
     /// The editor text was just (re)loaded; old undo steps must not come back.
     clear_undo: bool,
@@ -99,6 +102,7 @@ impl NoteSyncApp {
             clear_undo: false,
             collapsed: HashSet::new(),
             is_preview: false,
+            was_preview: false,
             markdown_cache: egui_commonmark::CommonMarkCache::default(),
             menus,
         };
@@ -176,6 +180,7 @@ impl NoteSyncApp {
     }
 
     fn remove_folder(&mut self, path: &Path) {
+        self.collapsed.remove(path);
         self.update_folders(|cfg| cfg.remove_folder(path));
     }
 
@@ -417,7 +422,9 @@ impl NoteSyncApp {
             .margin(egui::vec2(8.0, 6.0))
             .desired_width(f32::INFINITY);
         let response = ui.add(field);
-        if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        // egui drops focus on Esc in the same frame, so lost_focus counts too.
+        let was_focused = response.has_focus() || response.lost_focus();
+        if was_focused && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.query.clear();
         }
         self.extra.set_query(&self.query);
@@ -550,20 +557,28 @@ impl NoteSyncApp {
         if clear_undo {
             forget_undo(ui.ctx(), editor_id);
         }
+        let mut linked = None;
         if self.is_preview {
             editor.is_composing = false;
-            show_preview(ui, &editor.text, &mut self.markdown_cache);
+            let links = show_preview(ui, &editor.text, &mut self.markdown_cache);
+            linked = links.iter().find_map(|url| resolve_note_link(&editor.path, url));
         } else {
+            if self.was_preview {
+                ui.ctx().memory_mut(|memory| memory.request_focus(editor_id));
+            }
             show_text_editor(ui, editor, editor_id);
         }
+        self.was_preview = self.is_preview;
         if reload {
             editor.reload();
             self.clear_undo = true;
         }
+        if let Some(path) = linked {
+            self.request_open(path);
+        }
     }
 
     fn autosave(&mut self) {
-
         // A backup run may be reading the folder; a half-written file would land in a commit.
         if self.scheduler.is_running() {
             return;
@@ -676,7 +691,8 @@ impl eframe::App for NoteSyncApp {
             egui::SidePanel::left("notes")
                 .resizable(true)
                 .default_width(300.0)
-                .width_range(220.0..=520.0)
+                // Leave the editor at least 360 pt so its header still fits.
+                .width_range(220.0..=(ctx.screen_rect().width() - 360.0).clamp(220.0, 520.0))
                 .show(ctx, |ui| self.show_sidebar(ui));
             egui::CentralPanel::default()
                 .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(24.0))

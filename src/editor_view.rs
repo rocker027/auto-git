@@ -59,14 +59,65 @@ pub fn show_text_editor(ui: &mut egui::Ui, editor: &mut OpenNote, editor_id: Id)
     }
 }
 
+/// Larger notes are not rendered: the viewer lays out the whole text every frame.
+const PREVIEW_MAX_BYTES: usize = 100_000;
+
 /// Rendered Markdown of the open note. Read only.
-pub fn show_preview(ui: &mut egui::Ui, text: &str, cache: &mut egui_commonmark::CommonMarkCache) {
+/// Returns the non-web links clicked this frame; they are not opened here.
+pub fn show_preview(
+    ui: &mut egui::Ui,
+    text: &str,
+    cache: &mut egui_commonmark::CommonMarkCache,
+) -> Vec<String> {
+    if text.len() > PREVIEW_MAX_BYTES {
+        ui.weak("筆記太大，請用編輯模式");
+        return Vec::new();
+    }
+    ui.style_mut().url_in_tooltip = true;
     egui::ScrollArea::vertical()
         .id_salt("note-preview")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui_commonmark::CommonMarkViewer::new().show(ui, cache, text);
         });
+    take_local_links(ui.ctx())
+}
+
+/// Keeps http(s) links for the browser; pulls every other link out of egui's output.
+fn take_local_links(ctx: &egui::Context) -> Vec<String> {
+    ctx.output_mut(|output| {
+        let mut local = Vec::new();
+        output.commands.retain(|command| match command {
+            egui::OutputCommand::OpenUrl(open) if !is_web_link(&open.url) => {
+                local.push(open.url.clone());
+                false
+            }
+            _ => true,
+        });
+        local
+    })
+}
+
+fn is_web_link(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+/// A relative link to another Markdown note, resolved next to the open note.
+/// Anything else (file://, app schemes, missing files) gives None.
+pub fn resolve_note_link(note: &std::path::Path, url: &str) -> Option<std::path::PathBuf> {
+    if url.contains("://") || url.starts_with('/') || url.contains(':') {
+        return None;
+    }
+    let target = url.split('#').next()?.replace("%20", " ");
+    if target.is_empty() {
+        return None;
+    }
+    let path = note.parent()?.join(target);
+    let is_markdown = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"));
+    (is_markdown && path.is_file()).then_some(path)
 }
 
 /// Returns true when the user takes the version from disk.
@@ -108,5 +159,40 @@ pub fn forget_undo(ctx: &egui::Context, id: Id) {
     if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
         state.clear_undoer();
         state.store(ctx, id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn note_links_resolve_next_to_the_open_note_only() {
+        let dir = tempdir().unwrap();
+        let note = dir.path().join("a.md");
+        fs::write(&note, "x").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/other note.md"), "y").unwrap();
+        assert_eq!(
+            resolve_note_link(&note, "sub/other%20note.md#part"),
+            Some(dir.path().join("sub/other note.md"))
+        );
+        assert_eq!(resolve_note_link(&note, "missing.md"), None);
+        assert_eq!(resolve_note_link(&note, "file:///etc/hosts"), None);
+        assert_eq!(resolve_note_link(&note, "/etc/hosts"), None);
+        assert_eq!(resolve_note_link(&note, "x-apple.systempreferences:com.apple"), None);
+        assert_eq!(resolve_note_link(&note, "#heading"), None);
+        fs::write(dir.path().join("run.sh"), "echo").unwrap();
+        assert_eq!(resolve_note_link(&note, "run.sh"), None);
+    }
+
+    #[test]
+    fn only_web_links_go_to_the_browser() {
+        assert!(is_web_link("https://example.com"));
+        assert!(is_web_link("http://example.com"));
+        assert!(!is_web_link("file:///etc/hosts"));
+        assert!(!is_web_link("other.md"));
     }
 }
