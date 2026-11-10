@@ -8,9 +8,12 @@ use crate::notes::{self, FolderNotes};
 use crate::qmd_ops::SearchHit;
 use crate::scheduler::Scheduler;
 use crate::status::{self, BackupState, Tone};
-use crate::editor_view::{forget_undo, show_conflict_banner, show_editor_header, track_composing};
+use crate::editor_view::{
+    forget_undo, show_conflict_banner, show_editor_header, show_preview, show_text_editor,
+};
 use crate::widgets;
 use eframe::egui::{self, Id, RichText};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +55,11 @@ pub struct NoteSyncApp {
     folder_error: String,
     pending: Option<Pending>,
     may_close: bool,
+    /// Folders whose notes are hidden in the list.
+    collapsed: HashSet<PathBuf>,
+    /// Show the open note as rendered Markdown instead of the editor.
+    is_preview: bool,
+    markdown_cache: egui_commonmark::CommonMarkCache,
     /// The editor text was just (re)loaded; old undo steps must not come back.
     clear_undo: bool,
     menus: SystemMenus,
@@ -89,6 +97,9 @@ impl NoteSyncApp {
             pending: None,
             may_close: false,
             clear_undo: false,
+            collapsed: HashSet::new(),
+            is_preview: false,
+            markdown_cache: egui_commonmark::CommonMarkCache::default(),
             menus,
         };
         app.rescan();
@@ -282,12 +293,16 @@ impl NoteSyncApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (save, find) = ctx.input_mut(|input| {
+        let (save, find, toggle_preview) = ctx.input_mut(|input| {
             (
                 input.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
                 input.consume_key(egui::Modifiers::COMMAND, egui::Key::F),
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::E),
             )
         });
+        if toggle_preview && self.editor.is_some() {
+            self.is_preview = !self.is_preview;
+        }
         let can_save = self
             .editor
             .as_ref()
@@ -307,6 +322,13 @@ impl NoteSyncApp {
         self.show_status_row(ui);
         ui.add_space(4.0);
         self.show_search_field(ui);
+        ui.add_space(4.0);
+        if ui.button("＋ 加入資料夾").clicked() {
+            self.pick_and_add_folder();
+        }
+        if !self.folder_error.is_empty() {
+            ui.colored_label(ui.visuals().error_fg_color, &self.folder_error);
+        }
         ui.add_space(6.0);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -407,6 +429,7 @@ impl NoteSyncApp {
         let words = notes::search_words(&query);
         let mut chosen = None;
         let mut removed = None;
+        let mut toggled = None;
         let mut shown = 0;
         for group in &self.library {
             let matching: Vec<_> = group
@@ -418,7 +441,11 @@ impl NoteSyncApp {
                 continue;
             }
             shown += matching.len();
-            let header = folder_header(ui, &group.folder, &folders);
+            let is_open = is_folder_open(&self.collapsed, &group.folder, !query.is_empty());
+            let header = widgets::folder_header(ui, &folder_label(&group.folder, &folders), is_open);
+            if header.clicked() && query.is_empty() {
+                toggled = Some(group.folder.clone());
+            }
             header.context_menu(|ui| {
                 if ui.button("移除這個資料夾").clicked() {
                     removed = Some(group.folder.clone());
@@ -428,12 +455,19 @@ impl NoteSyncApp {
             if !group.exists {
                 ui.colored_label(ui.visuals().error_fg_color, "  找不到這個資料夾");
             }
-            for note in matching {
-                if self.note_row(ui, &note.path, &note.title, note.modified) {
-                    chosen = Some(note.path.clone());
+            if is_open {
+                for note in matching {
+                    if self.note_row(ui, &note.path, &note.title, note.modified) {
+                        chosen = Some(note.path.clone());
+                    }
                 }
             }
-            ui.add_space(10.0);
+            ui.add_space(if is_open { 10.0 } else { 2.0 });
+        }
+        if let Some(folder) = toggled {
+            if !self.collapsed.remove(&folder) {
+                self.collapsed.insert(folder);
+            }
         }
         shown += self.show_extra_hits(ui, &mut chosen);
         self.show_list_footer(ui, &query, shown);
@@ -486,22 +520,13 @@ impl NoteSyncApp {
         hits.len()
     }
 
-    fn show_list_footer(&mut self, ui: &mut egui::Ui, query: &str, shown: usize) {
+    fn show_list_footer(&self, ui: &mut egui::Ui, query: &str, shown: usize) {
         if !query.is_empty() && shown == 0 && !self.extra.is_busy() {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| ui.weak("沒有符合的筆記"));
         }
         if let Some(failure) = &self.extra.failure {
             ui.weak("其他地方的搜尋失敗").on_hover_text(failure);
-        }
-        if query.is_empty() {
-            ui.add_space(4.0);
-            if ui.button("＋ 加入資料夾").clicked() {
-                self.pick_and_add_folder();
-            }
-        }
-        if !self.folder_error.is_empty() {
-            ui.colored_label(ui.visuals().error_fg_color, &self.folder_error);
         }
     }
 
@@ -517,7 +542,7 @@ impl NoteSyncApp {
             return;
         };
         let mut reload = false;
-        show_editor_header(ui, editor);
+        show_editor_header(ui, editor, &mut self.is_preview);
         if editor.has_conflict {
             reload = show_conflict_banner(ui);
         }
@@ -525,25 +550,11 @@ impl NoteSyncApp {
         if clear_undo {
             forget_undo(ui.ctx(), editor_id);
         }
-        track_composing(ui, editor);
-        let edited: egui::Response = egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.add_sized(
-                    ui.available_size(),
-                    egui::TextEdit::multiline(&mut editor.text)
-                        .id(editor_id)
-                        .lock_focus(true)
-                        .frame(false)
-                        .font(egui::FontId::proportional(16.0)),
-                )
-            })
-            .inner;
-        if edited.changed() {
-            editor.mark_edited(Instant::now());
-        }
-        if !edited.has_focus() {
+        if self.is_preview {
             editor.is_composing = false;
+            show_preview(ui, &editor.text, &mut self.markdown_cache);
+        } else {
+            show_text_editor(ui, editor, editor_id);
         }
         if reload {
             editor.reload();
@@ -552,6 +563,7 @@ impl NoteSyncApp {
     }
 
     fn autosave(&mut self) {
+
         // A backup run may be reading the folder; a half-written file would land in a commit.
         if self.scheduler.is_running() {
             return;
@@ -690,16 +702,9 @@ impl eframe::App for NoteSyncApp {
     }
 }
 
-fn folder_header(ui: &mut egui::Ui, folder: &Path, folders: &[PathBuf]) -> egui::Response {
-    ui.add(
-        egui::Label::new(
-            RichText::new(folder_label(folder, folders))
-                .small()
-                .strong()
-                .color(ui.visuals().weak_text_color()),
-        )
-        .sense(egui::Sense::click()),
-    )
+/// Searching always shows matches, even inside folders the user closed.
+fn is_folder_open(collapsed: &HashSet<PathBuf>, folder: &Path, is_searching: bool) -> bool {
+    is_searching || !collapsed.contains(folder)
 }
 
 pub fn cjk_font_bytes() -> Option<Vec<u8>> {
@@ -728,6 +733,15 @@ fn choose_folder() -> Result<Option<PathBuf>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_folders_open_while_searching() {
+        let notes = PathBuf::from("/n");
+        let closed: HashSet<PathBuf> = [notes.clone()].into();
+        assert!(!is_folder_open(&closed, &notes, false));
+        assert!(is_folder_open(&closed, &notes, true));
+        assert!(is_folder_open(&HashSet::new(), &notes, false));
+    }
 
     #[test]
     fn cjk_fallback_font_is_on_this_mac() {

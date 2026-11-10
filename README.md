@@ -4,9 +4,9 @@ Lightweight macOS menu-bar tool for Markdown note folders:
 
 - Watch multiple folders and periodically `git add` + `git commit` (`update N files`)
 - `git init` when a folder is not a repo
-- Left: every Markdown note in the watched folders, newest first; the search box filters by name and text as you type
+- Left: 「＋ 加入資料夾」 above the list, then every Markdown note grouped by folder, newest first. Click a folder title to fold or unfold it; searching shows matches in every folder. The search box filters by name and text as you type
 - Optional: with [`qmd`](https://github.com/tobi/qmd) on PATH, matching notes from other qmd collections appear under 「其他地方」
-- Right: one note open for editing. It saves on its own about 1 s after you stop typing, and before switching notes, closing or quitting; ⌘S saves at once. Autosave never overwrites a note changed elsewhere and never recreates one moved or deleted elsewhere; it stops and offers the newer version, and waits while an input method is still composing. Unsaved edits pause auto-commit
+- Right: one note open for editing. It saves on its own about 1 s after you stop typing, and before switching notes, closing or quitting; ⌘S saves at once. 「編輯｜預覽」 (⌘E) switches between the editor and rendered Markdown. Autosave never overwrites a note changed elsewhere and never recreates one moved or deleted elsewhere; it stops and offers the newer version, and waits while an input method is still composing. Unsaved edits pause auto-commit
 - The line above the search box tells whether everything is backed up; `⋯` holds 立即備份, pause, add and remove folder
 
 ## Requirements

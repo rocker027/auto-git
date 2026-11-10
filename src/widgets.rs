@@ -36,6 +36,41 @@ pub fn primary_button<'a>(ui: &Ui, text: &str, size: f32) -> egui::Button<'a> {
     egui::Button::new(label).fill(visuals.selection.bg_fill)
 }
 
+/// Folder title in the note list. Click to show or hide its notes.
+pub fn folder_header(ui: &mut Ui, label: &str, is_open: bool) -> Response {
+    let size = vec2(ui.available_width(), 26.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| {
+        WidgetInfo::selected(WidgetType::CollapsingHeader, ui.is_enabled(), is_open, label)
+    });
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    if response.hovered() || response.has_focus() {
+        ui.painter()
+            .rect_filled(rect, CORNER, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let color = ui.visuals().weak_text_color();
+    paint_disclosure(ui, pos2(rect.left() + 10.0, rect.center().y), is_open, color);
+    let font = FontId::proportional(13.0);
+    let galley = ui.fonts(|fonts| fonts.layout_job(single_line(label, font, color, rect.width() - 28.0)));
+    let pos = pos2(rect.left() + 22.0, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(pos, galley, color);
+    response
+}
+
+/// Solid triangle: pointing down when open, right when closed.
+fn paint_disclosure(ui: &Ui, center: egui::Pos2, is_open: bool, color: Color32) {
+    let r = 4.5;
+    let points = if is_open {
+        vec![center + vec2(-r, -r * 0.6), center + vec2(r, -r * 0.6), center + vec2(0.0, r * 0.7)]
+    } else {
+        vec![center + vec2(-r * 0.6, -r), center + vec2(r * 0.7, 0.0), center + vec2(-r * 0.6, r)]
+    };
+    ui.painter()
+        .add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+}
+
 /// One clickable list row: title on the left, short meta text on the right.
 pub fn note_row(ui: &mut Ui, title: &str, meta: &str, selected: bool) -> Response {
     let size = vec2(ui.available_width(), ROW_HEIGHT);
