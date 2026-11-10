@@ -563,10 +563,11 @@ impl NoteSyncApp {
             let links = show_preview(ui, &editor.text, &mut self.markdown_cache);
             linked = links.iter().find_map(|url| resolve_note_link(&editor.path, url));
         } else {
+            show_text_editor(ui, editor, editor_id);
+            // After the TextEdit: a click on 「編輯」 this frame would otherwise drop the focus again.
             if self.was_preview {
                 ui.ctx().memory_mut(|memory| memory.request_focus(editor_id));
             }
-            show_text_editor(ui, editor, editor_id);
         }
         self.was_preview = self.is_preview;
         if reload {

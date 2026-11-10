@@ -74,32 +74,79 @@ pub fn show_preview(
         return Vec::new();
     }
     ui.style_mut().url_in_tooltip = true;
+    let before = ui.ctx().output(|output| output.commands.len());
     egui::ScrollArea::vertical()
         .id_salt("note-preview")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui_commonmark::CommonMarkViewer::new().show(ui, cache, text);
         });
-    take_local_links(ui.ctx())
+    take_local_links(ui.ctx(), before)
 }
 
-/// Keeps http(s) links for the browser; pulls every other link out of egui's output.
-fn take_local_links(ctx: &egui::Context) -> Vec<String> {
+/// Keeps web and mail links for the system; pulls every other link the preview
+/// added (from index `from` on) out of egui's output.
+fn take_local_links(ctx: &egui::Context, from: usize) -> Vec<String> {
     ctx.output_mut(|output| {
         let mut local = Vec::new();
-        output.commands.retain(|command| match command {
-            egui::OutputCommand::OpenUrl(open) if !is_web_link(&open.url) => {
-                local.push(open.url.clone());
-                false
+        let mut index = 0;
+        output.commands.retain(|command| {
+            let is_mine = index >= from;
+            index += 1;
+            match command {
+                egui::OutputCommand::OpenUrl(open) if is_mine && !is_web_link(&open.url) => {
+                    local.push(open.url.clone());
+                    false
+                }
+                _ => true,
             }
-            _ => true,
         });
         local
     })
 }
 
 fn is_web_link(url: &str) -> bool {
-    url.starts_with("https://") || url.starts_with("http://")
+    let lower = url.to_ascii_lowercase();
+    ["https://", "http://", "mailto:"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
+}
+
+/// Decodes %XX escapes (UTF-8), leaving malformed ones as they are.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok());
+        match (bytes[i], hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(value)) => {
+                out.push(value);
+                i += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Removes `.` and `..` by the text of the path, without touching the disk,
+/// so the result compares equal to the paths in the note list.
+fn tidy_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    path.components().fold(std::path::PathBuf::new(), |mut tidy, part| {
+        match part {
+            Component::ParentDir => {
+                tidy.pop();
+            }
+            Component::CurDir => {}
+            other => tidy.push(other),
+        }
+        tidy
+    })
 }
 
 /// A relative link to another Markdown note, resolved next to the open note.
@@ -108,11 +155,12 @@ pub fn resolve_note_link(note: &std::path::Path, url: &str) -> Option<std::path:
     if url.contains("://") || url.starts_with('/') || url.contains(':') {
         return None;
     }
-    let target = url.split('#').next()?.replace("%20", " ");
+    let target = percent_decode(url.split(['#', '?']).next()?);
+    let target = target.trim_start_matches('<').trim_end_matches('>');
     if target.is_empty() {
         return None;
     }
-    let path = note.parent()?.join(target);
+    let path = tidy_path(&note.parent()?.join(target));
     let is_markdown = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -184,6 +232,17 @@ mod tests {
         assert_eq!(resolve_note_link(&note, "/etc/hosts"), None);
         assert_eq!(resolve_note_link(&note, "x-apple.systempreferences:com.apple"), None);
         assert_eq!(resolve_note_link(&note, "#heading"), None);
+        assert_eq!(resolve_note_link(&note, "../sub/../a.md"), None, "outside the temp dir");
+        assert_eq!(
+            resolve_note_link(&dir.path().join("sub/other note.md"), "../a.md?x=1"),
+            Some(dir.path().join("a.md")),
+            "`..` is folded so the path matches the note list"
+        );
+        fs::write(dir.path().join("中文.md"), "z").unwrap();
+        assert_eq!(
+            resolve_note_link(&note, "%E4%B8%AD%E6%96%87.md"),
+            Some(dir.path().join("中文.md"))
+        );
         fs::write(dir.path().join("run.sh"), "echo").unwrap();
         assert_eq!(resolve_note_link(&note, "run.sh"), None);
     }
@@ -192,6 +251,8 @@ mod tests {
     fn only_web_links_go_to_the_browser() {
         assert!(is_web_link("https://example.com"));
         assert!(is_web_link("http://example.com"));
+        assert!(is_web_link("HTTPS://example.com"));
+        assert!(is_web_link("mailto:a@example.com"));
         assert!(!is_web_link("file:///etc/hosts"));
         assert!(!is_web_link("other.md"));
     }
