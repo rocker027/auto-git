@@ -33,8 +33,8 @@ pub fn on_close_request(is_quitting: bool, may_close: bool, save: impl FnOnce() 
     }
 }
 
-/// Handles the tray and app-menu items as AppKit delivers them, so they work
-/// while the window is hidden and egui draws no frames.
+/// Handles the tray and app-menu items as AppKit delivers them (on the main thread),
+/// instead of polling a channel from `update`.
 pub fn install_menu_handler(
     ctx: egui::Context,
     show_id: MenuId,
@@ -45,13 +45,15 @@ pub fn install_menu_handler(
         if event.id == show_id {
             show_app(&ctx);
         } else if quit_ids.contains(&event.id) {
+            // The close request is handled in `update`; the window only comes back
+            // if a "could not save" question has to be asked.
             quitting.store(true, Ordering::SeqCst);
-            // Visible again, so a "could not save" question can be seen and answered.
-            show_app(&ctx);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         ctx.request_repaint();
     }));
+    // Pointer events over the tray icon are not used; drop them instead of queueing forever.
+    tray_icon::TrayIconEvent::set_event_handler(Some(|_| {}));
 }
 
 /// Hides the whole app like ⌘H: the window goes away, the menu bar icon and backups stay.

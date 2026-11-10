@@ -299,8 +299,13 @@ impl NoteSyncApp {
         match action {
             CloseAction::Allow => {}
             CloseAction::Hide => window_life::hide_app(ctx),
+            // A quit question already on screen stays a quit.
+            CloseAction::AskThenHide if matches!(self.pending, Some(Pending::Close)) => {}
             CloseAction::AskThenHide => self.pending = Some(Pending::Hide),
-            CloseAction::AskThenQuit => self.pending = Some(Pending::Close),
+            CloseAction::AskThenQuit => {
+                window_life::show_app(ctx);
+                self.pending = Some(Pending::Close);
+            }
         }
     }
 
