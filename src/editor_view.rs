@@ -15,17 +15,22 @@ pub enum ViewMode {
 }
 
 pub fn show_editor_header(ui: &mut egui::Ui, editor: &OpenNote, mode: &mut ViewMode) {
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.weak(if editor.is_dirty() { "● 編輯中" } else { "✓ 已儲存" });
-            ui.add_space(12.0);
-            show_mode_switch(ui, mode);
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.add(egui::Label::new(RichText::new(notes::note_title(&editor.path)).heading()).truncate())
-                    .on_hover_text(editor.path.display().to_string());
+    ui.add(egui::Label::new(RichText::new(notes::note_title(&editor.path)).heading().strong()).truncate())
+        .on_hover_text(editor.path.display().to_string());
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        egui::Frame::new()
+            .fill(ui.visuals().faint_bg_color)
+            .corner_radius(7.0)
+            .inner_margin(3.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| show_mode_switch(ui, mode));
             });
-        });
+        ui.add_space(8.0);
+        ui.weak(if editor.is_dirty() { "編輯中" } else { "已儲存" });
     });
+    ui.add_space(8.0);
+    ui.separator();
     if !editor.error.is_empty() {
         ui.colored_label(ui.visuals().error_fg_color, &editor.error);
     }
@@ -33,13 +38,13 @@ pub fn show_editor_header(ui: &mut egui::Ui, editor: &OpenNote, mode: &mut ViewM
 }
 
 /// 編輯｜預覽｜歷史 switch; ⌘E flips between 編輯 and 預覽.
-/// Added right to left, so 歷史 comes first.
+/// Kept separate from the title so every mode stays reachable in narrow windows.
 fn show_mode_switch(ui: &mut egui::Ui, mode: &mut ViewMode) {
     ui.spacing_mut().item_spacing.x = 2.0;
     let segments = [
-        (ViewMode::History, "歷史", "已備份的版本"),
-        (ViewMode::Preview, "預覽", "⌘E"),
         (ViewMode::Edit, "編輯", "⌘E"),
+        (ViewMode::Preview, "預覽", "⌘E"),
+        (ViewMode::History, "歷史", "已備份的版本"),
     ];
     for (segment, label, hint) in segments {
         if ui.selectable_label(*mode == segment, label).on_hover_text(hint).clicked() {
@@ -197,7 +202,7 @@ pub fn show_conflict_banner(ui: &mut egui::Ui) -> bool {
         .corner_radius(6.0)
         .inner_margin(10.0)
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("⚠ 這則筆記在別的地方被改過了");
                 reload = ui.button("改用最新版本").clicked();
             });

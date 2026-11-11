@@ -5,7 +5,7 @@ use eframe::egui::{
     Ui, WidgetInfo, WidgetType,
 };
 
-const ROW_HEIGHT: f32 = 32.0;
+const ROW_HEIGHT: f32 = 54.0;
 const ROW_PADDING: f32 = 10.0;
 const CORNER: f32 = 6.0;
 
@@ -64,16 +64,27 @@ pub fn recent_notes(
 pub fn apply_style(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
         style.text_styles = [
-            (TextStyle::Heading, FontId::proportional(22.0)),
-            (TextStyle::Body, FontId::proportional(15.0)),
-            (TextStyle::Button, FontId::proportional(15.0)),
+            (TextStyle::Heading, FontId::proportional(20.0)),
+            (TextStyle::Body, FontId::proportional(14.0)),
+            (TextStyle::Button, FontId::proportional(13.0)),
             (TextStyle::Small, FontId::proportional(12.5)),
             (TextStyle::Monospace, FontId::monospace(14.0)),
         ]
         .into();
         style.spacing.button_padding = vec2(12.0, 6.0);
         style.spacing.item_spacing = vec2(8.0, 6.0);
-        style.spacing.interact_size.y = 30.0;
+        style.spacing.interact_size.y = 28.0;
+        let dark = style.visuals.dark_mode;
+        style.visuals.panel_fill = if dark { Color32::from_rgb(30, 30, 32) } else { Color32::WHITE };
+        style.visuals.extreme_bg_color = if dark { Color32::from_rgb(24, 24, 26) } else { Color32::WHITE };
+        style.visuals.selection.bg_fill = Color32::from_rgb(0, 92, 200);
+        style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
+        style.visuals.widgets.inactive.corner_radius = 6.0.into();
+        style.visuals.widgets.hovered.corner_radius = 6.0.into();
+        style.visuals.widgets.active.corner_radius = 6.0.into();
+        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(
+            1.0_f32, if dark { Color32::from_gray(75) } else { Color32::from_gray(215) },
+        );
     });
 }
 
@@ -122,7 +133,7 @@ fn paint_disclosure(ui: &Ui, center: egui::Pos2, is_open: bool, color: Color32) 
         .add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
 }
 
-/// One clickable list row: title on the left, short meta text on the right.
+/// Two-line note row keeps titles readable in a narrow sidebar.
 pub fn note_row(ui: &mut Ui, title: &str, meta: &str, selected: bool) -> Response {
     let size = vec2(ui.available_width(), ROW_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
@@ -139,14 +150,14 @@ pub fn note_row(ui: &mut Ui, title: &str, meta: &str, selected: bool) -> Respons
     let painter = ui.painter();
     let meta_galley =
         painter.layout_no_wrap(meta.to_owned(), TextStyle::Small.resolve(ui.style()), meta_color);
-    let title_width = rect.width() - ROW_PADDING * 3.0 - meta_galley.size().x;
+    let title_width = rect.width() - ROW_PADDING * 2.0;
     let title_galley = ui.fonts(|fonts| {
         fonts.layout_job(single_line(title, TextStyle::Body.resolve(ui.style()), text_color, title_width))
     });
-    let title_pos = pos2(rect.left() + ROW_PADDING, rect.center().y - title_galley.size().y / 2.0);
+    let title_pos = pos2(rect.left() + ROW_PADDING, rect.top() + 8.0);
     let meta_pos = pos2(
-        rect.right() - ROW_PADDING - meta_galley.size().x,
-        rect.center().y - meta_galley.size().y / 2.0,
+        rect.left() + ROW_PADDING,
+        rect.bottom() - meta_galley.size().y - 7.0,
     );
     painter.galley(title_pos, title_galley, text_color);
     painter.galley(meta_pos, meta_galley, meta_color);

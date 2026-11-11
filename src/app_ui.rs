@@ -346,13 +346,15 @@ impl NoteSyncApp {
 
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        self.show_status_row(ui);
-        ui.add_space(4.0);
+        ui.label(RichText::new("筆記").size(20.0).strong());
+        ui.add_space(6.0);
         self.show_search_field(ui);
         ui.add_space(4.0);
         if ui.button("＋ 加入資料夾").clicked() {
             self.pick_and_add_folder();
         }
+        self.show_status_row(ui);
+        ui.separator();
         if !self.folder_error.is_empty() {
             ui.colored_label(ui.visuals().error_fg_color, &self.folder_error);
         }
@@ -444,10 +446,10 @@ impl NoteSyncApp {
     fn show_search_field(&mut self, ui: &mut egui::Ui) {
         let field = egui::TextEdit::singleline(&mut self.query)
             .id(Id::new(SEARCH_ID))
-            .hint_text("🔍 搜尋")
+            .hint_text("搜尋筆記")
             .margin(egui::vec2(8.0, 6.0))
             .desired_width(f32::INFINITY);
-        let response = ui.add(field);
+        let response = ui.add(field).on_hover_text("搜尋名稱與內容 · ⌘F");
         // egui drops focus on Esc in the same frame, so lost_focus counts too.
         let was_focused = response.has_focus() || response.lost_focus();
         if was_focused && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -579,7 +581,12 @@ impl NoteSyncApp {
         }
         let clear_undo = std::mem::take(&mut self.clear_undo);
         let Some(editor) = self.editor.as_mut() else {
-            ui.centered_and_justified(|ui| ui.weak("← 選一則筆記"));
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() * 0.35).max(24.0));
+                ui.heading("選擇一則筆記");
+                ui.add_space(8.0);
+                ui.weak("從左側列表選取，或按 ⌘F 搜尋。");
+            });
             return;
         };
         let mut reload = false;
@@ -646,8 +653,12 @@ impl NoteSyncApp {
     fn show_welcome(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() / 2.0 - 60.0).max(24.0));
+            ui.heading("你的筆記，集中在這裡");
+            ui.add_space(8.0);
+            ui.weak("加入 Markdown 資料夾，即可編輯、搜尋與自動備份。");
+            ui.add_space(20.0);
             let button =
-                widgets::primary_button(ui, "選擇筆記資料夾", 18.0).min_size(egui::vec2(240.0, 52.0));
+                widgets::primary_button(ui, "選擇筆記資料夾…", 14.0).min_size(egui::vec2(180.0, 34.0));
             if ui.add(button).clicked() {
                 self.pick_and_add_folder();
             }
@@ -743,9 +754,16 @@ impl eframe::App for NoteSyncApp {
         } else {
             egui::SidePanel::left("notes")
                 .resizable(true)
-                .default_width(300.0)
-                // Leave the editor at least 360 pt so its header still fits.
+                .default_width(280.0)
+                // Reserve room for the document; its controls wrap independently of the title.
                 .width_range(220.0..=(ctx.screen_rect().width() - 360.0).clamp(220.0, 520.0))
+                .frame(egui::Frame::new()
+                    .fill(if ctx.style().visuals.dark_mode {
+                        egui::Color32::from_rgb(38, 38, 40)
+                    } else {
+                        egui::Color32::from_rgb(244, 244, 246)
+                    })
+                    .inner_margin(12.0))
                 .show(ctx, |ui| self.show_sidebar(ui));
             egui::CentralPanel::default()
                 .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(24.0))
