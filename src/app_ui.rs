@@ -346,11 +346,9 @@ impl NoteSyncApp {
 
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.label(RichText::new("筆記").size(20.0).strong());
-        ui.add_space(6.0);
         self.show_search_field(ui);
         ui.add_space(4.0);
-        if ui.button("＋ 加入資料夾").clicked() {
+        if ui.add(egui::Button::new("＋ 加入資料夾").frame(false)).clicked() {
             self.pick_and_add_folder();
         }
         self.show_status_row(ui);
@@ -379,13 +377,13 @@ impl NoteSyncApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.show_main_menu(ui);
                 let color = match line.tone {
-                    Tone::Good => ui.visuals().text_color(),
-                    Tone::Quiet => ui.visuals().weak_text_color(),
+                    Tone::Good => widgets::secondary_color(ui),
+                    Tone::Quiet => widgets::secondary_color(ui),
                     Tone::Problem => ui.visuals().error_fg_color,
                 };
                 if !is_problem {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        let label = ui.add(egui::Label::new(RichText::new(&line.text).color(color)).truncate());
+                        let label = ui.add(egui::Label::new(RichText::new(&line.text).small().color(color)).truncate());
                         if let Some(detail) = &line.detail {
                             label.on_hover_text(detail);
                         }

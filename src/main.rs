@@ -126,6 +126,16 @@ fn install_cjk_fallback(ctx: &egui::Context) {
             list.push("cjk".to_owned());
         }
     }
+    // Use locally installed macOS fonts; no system font is bundled or redistributed.
+    for (name, path, family) in [
+        ("macos-ui", "/System/Library/Fonts/SFNS.ttf", egui::FontFamily::Proportional),
+        ("macos-mono", "/System/Library/Fonts/SFNSMono.ttf", egui::FontFamily::Monospace),
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(name.into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+            fonts.families.entry(family).or_default().insert(0, name.into());
+        }
+    }
     ctx.set_fonts(fonts);
 }
 

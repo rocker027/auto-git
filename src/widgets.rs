@@ -5,7 +5,7 @@ use eframe::egui::{
     Ui, WidgetInfo, WidgetType,
 };
 
-const ROW_HEIGHT: f32 = 54.0;
+const ROW_HEIGHT: f32 = 50.0;
 const ROW_PADDING: f32 = 10.0;
 const CORNER: f32 = 6.0;
 
@@ -79,13 +79,41 @@ pub fn apply_style(ctx: &egui::Context) {
         style.visuals.extreme_bg_color = if dark { Color32::from_rgb(24, 24, 26) } else { Color32::WHITE };
         style.visuals.selection.bg_fill = Color32::from_rgb(0, 92, 200);
         style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
-        style.visuals.widgets.inactive.corner_radius = 6.0.into();
-        style.visuals.widgets.hovered.corner_radius = 6.0.into();
-        style.visuals.widgets.active.corner_radius = 6.0.into();
-        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(
-            1.0_f32, if dark { Color32::from_gray(75) } else { Color32::from_gray(215) },
-        );
+        let foreground = if dark { Color32::from_gray(235) } else { Color32::from_gray(35) };
+        let control = if dark { Color32::from_gray(57) } else { Color32::from_gray(240) };
+        let hover = if dark { Color32::from_gray(72) } else { Color32::from_gray(225) };
+        let separator = if dark { Color32::from_gray(60) } else { Color32::from_gray(220) };
+        style.visuals.widgets.noninteractive.fg_stroke.color = foreground;
+        style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, separator);
+        for widget in [
+            &mut style.visuals.widgets.inactive,
+            &mut style.visuals.widgets.hovered,
+            &mut style.visuals.widgets.active,
+            &mut style.visuals.widgets.open,
+        ] {
+            widget.corner_radius = 6.0.into();
+            widget.bg_stroke = egui::Stroke::NONE;
+            widget.fg_stroke = egui::Stroke::new(1.0_f32, foreground);
+            widget.bg_fill = control;
+            widget.weak_bg_fill = control;
+        }
+        style.visuals.widgets.hovered.bg_fill = hover;
+        style.visuals.widgets.hovered.weak_bg_fill = hover;
+        // Keep a visible keyboard focus ring even on borderless controls.
+        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, style.visuals.selection.bg_fill);
+        style.visuals.widgets.active.bg_fill = hover;
+        style.visuals.widgets.active.weak_bg_fill = hover;
+        style.visuals.faint_bg_color = if dark { Color32::from_gray(38) } else { Color32::from_gray(246) };
+        style.visuals.code_bg_color = control;
+        style.visuals.window_fill = if dark { Color32::from_gray(42) } else { Color32::from_gray(250) };
+        style.visuals.window_stroke = egui::Stroke::new(1.0_f32, separator);
+        style.visuals.hyperlink_color = if dark { Color32::from_rgb(100, 180, 255) } else { Color32::from_rgb(0, 92, 200) };
     });
+}
+
+/// Secondary information stays readable against the opaque sidebar and document surfaces.
+pub fn secondary_color(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode { Color32::from_gray(170) } else { Color32::from_gray(100) }
 }
 
 /// The one action the current screen is about, drawn in the accent color.
@@ -112,7 +140,7 @@ pub fn folder_header(ui: &mut Ui, label: &str, is_open: bool) -> Response {
         ui.painter()
             .rect_filled(rect, CORNER, ui.visuals().widgets.hovered.weak_bg_fill);
     }
-    let color = ui.visuals().weak_text_color();
+    let color = secondary_color(ui);
     paint_disclosure(ui, pos2(rect.left() + 10.0, rect.center().y), is_open, color);
     let font = FontId::proportional(13.0);
     let galley = ui.fonts(|fonts| fonts.layout_job(single_line(label, font, color, rect.width() - 28.0)));
@@ -146,7 +174,7 @@ pub fn note_row(ui: &mut Ui, title: &str, meta: &str, selected: bool) -> Respons
     paint_row_background(ui, &response, selected);
     let visuals = ui.style().interact_selectable(&response, selected);
     let text_color = visuals.text_color();
-    let meta_color = if selected { text_color } else { ui.visuals().weak_text_color() };
+    let meta_color = if selected { text_color } else { secondary_color(ui) };
     let painter = ui.painter();
     let meta_galley =
         painter.layout_no_wrap(meta.to_owned(), TextStyle::Small.resolve(ui.style()), meta_color);

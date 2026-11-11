@@ -27,7 +27,7 @@ pub fn show_editor_header(ui: &mut egui::Ui, editor: &OpenNote, mode: &mut ViewM
                 ui.horizontal(|ui| show_mode_switch(ui, mode));
             });
         ui.add_space(8.0);
-        ui.weak(if editor.is_dirty() { "編輯中" } else { "已儲存" });
+        ui.label(RichText::new(if editor.is_dirty() { "編輯中" } else { "已儲存" }).small().color(crate::widgets::secondary_color(ui)));
     });
     ui.add_space(8.0);
     ui.separator();
@@ -41,6 +41,9 @@ pub fn show_editor_header(ui: &mut egui::Ui, editor: &OpenNote, mode: &mut ViewM
 /// Kept separate from the title so every mode stays reachable in narrow windows.
 fn show_mode_switch(ui: &mut egui::Ui, mode: &mut ViewMode) {
     ui.spacing_mut().item_spacing.x = 2.0;
+    let dark = ui.visuals().dark_mode;
+    ui.visuals_mut().selection.bg_fill = if dark { egui::Color32::from_gray(88) } else { egui::Color32::WHITE };
+    ui.visuals_mut().selection.stroke.color = ui.visuals().text_color();
     let segments = [
         (ViewMode::Edit, "編輯", "⌘E"),
         (ViewMode::Preview, "預覽", "⌘E"),
@@ -101,11 +104,16 @@ pub fn show_preview(
     }
     ui.style_mut().url_in_tooltip = true;
     let before = ui.ctx().output(|output| output.commands.len());
-    egui::ScrollArea::vertical()
+    egui::ScrollArea::both()
         .id_salt("note-preview")
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            egui_commonmark::CommonMarkViewer::new().show(ui, cache, text);
+        .show_viewport(ui, |ui, viewport| {
+            ui.set_width(viewport.width());
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.spacing_mut().item_spacing.y = 8.0;
+            egui_commonmark::CommonMarkViewer::new()
+                .max_image_width(Some(viewport.width() as usize))
+                .show(ui, cache, text);
         });
     take_local_links(ui.ctx(), before)
 }
