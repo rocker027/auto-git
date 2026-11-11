@@ -1,7 +1,7 @@
 //! macOS bits the window needs: the folder picker and a font with CJK glyphs.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const CJK_FONT_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
@@ -12,6 +12,20 @@ pub fn cjk_font_bytes() -> Option<Vec<u8>> {
     CJK_FONT_CANDIDATES
         .iter()
         .find_map(|path| fs::read(path).ok())
+}
+
+/// Reveal the note in Finder, without opening it in another editor.
+pub fn reveal_in_finder(path: &Path) -> Result<(), String> {
+    let path = fs::canonicalize(path).map_err(|err| format!("找不到筆記：{err}"))?;
+    let output = std::process::Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(&path)
+        .output()
+        .map_err(|err| format!("無法開啟 Finder：{err}"))?;
+    if !output.status.success() {
+        return Err(format!("無法開啟 Finder：{}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    Ok(())
 }
 
 /// The system folder picker. Ok(None) when the user cancels.

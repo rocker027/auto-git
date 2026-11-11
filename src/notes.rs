@@ -1,5 +1,6 @@
 //! Lists Markdown notes inside the watched folders and filters them for search.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -13,8 +14,26 @@ pub struct Note {
     pub path: PathBuf,
     pub title: String,
     pub modified: Option<SystemTime>,
+    pub created: Option<SystemTime>,
     /// Lower-cased file text used for search.
     haystack: String,
+}
+
+impl Note {
+    /// A newly created copy can have an older preserved modification time.
+    pub fn updated_at(&self) -> Option<SystemTime> {
+        self.created.max(self.modified)
+    }
+}
+
+/// Latest notes across watched folders; overlapping roots do not duplicate a file.
+pub fn recent_notes(library: &[FolderNotes]) -> Vec<&Note> {
+    let mut seen = HashSet::new();
+    let mut notes: Vec<_> = library.iter().flat_map(|group| &group.notes)
+        .filter(|note| seen.insert(&note.path)).collect();
+    notes.sort_by(|a, b| b.updated_at().cmp(&a.updated_at()).then(a.path.cmp(&b.path)));
+    notes.truncate(30);
+    notes
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +96,9 @@ fn is_markdown(path: &Path) -> bool {
 }
 
 fn read_note(path: PathBuf) -> Note {
-    let modified = fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let metadata = fs::metadata(&path).ok();
+    let modified = metadata.as_ref().and_then(|m| m.modified().ok());
+    let created = metadata.as_ref().and_then(|m| m.created().ok());
     let mut text = fs::read(&path).unwrap_or_default();
     text.truncate(MAX_INDEXED_BYTES);
     let title = note_title(&path);
@@ -86,6 +107,7 @@ fn read_note(path: PathBuf) -> Note {
         path,
         title,
         modified,
+        created,
         haystack,
     }
 }
@@ -118,6 +140,70 @@ pub fn matches(note: &Note, words: &[String]) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn sample(path: &str, created: Option<u64>, modified: Option<u64>) -> Note {
+        let at = |seconds| UNIX_EPOCH + Duration::from_secs(seconds);
+        Note {
+            path: PathBuf::from(path), title: note_title(Path::new(path)),
+            created: created.map(at), modified: modified.map(at), haystack: String::new(),
+        }
+    }
+
+    #[test]
+    fn recent_notes_merge_roots_deduplicate_and_limit_to_thirty() {
+        let mut library: Vec<_> = ["a", "b"].into_iter().enumerate().map(|(root, name)| {
+            FolderNotes {
+                folder: PathBuf::from(name), exists: true,
+                notes: (0..20).map(|i| sample(
+                    &format!("{name}/{i}.md"), None, Some((i * 2 + root) as u64),
+                )).collect(),
+            }
+        }).collect();
+        library.push(library[1].clone());
+        let recent = recent_notes(&library);
+        assert_eq!(recent.len(), 30);
+        assert_eq!(recent.first().unwrap().path, Path::new("b/19.md"));
+        assert_eq!(recent.last().unwrap().path, Path::new("a/5.md"));
+        assert_eq!(recent.iter().map(|note| &note.path).collect::<HashSet<_>>().len(), 30);
+        assert!(recent.windows(2).all(|pair| pair[0].updated_at() > pair[1].updated_at()));
+    }
+
+    #[test]
+    fn recent_order_uses_newer_creation_or_modification_with_stable_ties() {
+        let mut group = FolderNotes {
+            folder: PathBuf::from("notes"), exists: true,
+            notes: vec![
+                sample("unknown.md", None, None),
+                sample("edited.md", Some(1), Some(50)),
+                sample("copy.md", Some(60), Some(2)),
+                sample("b.md", None, Some(30)),
+                sample("a.md", Some(30), None),
+            ],
+        };
+        let paths: Vec<_> = recent_notes(std::slice::from_ref(&group)).iter()
+            .map(|note| note.path.to_string_lossy().into_owned()).collect();
+        assert_eq!(paths, ["copy.md", "edited.md", "a.md", "b.md", "unknown.md"]);
+        group.notes[1].modified = Some(UNIX_EPOCH + Duration::from_secs(70));
+        assert_eq!(recent_notes(&[group])[0].path, Path::new("edited.md"));
+        assert!(recent_notes(&[]).is_empty());
+    }
+
+    #[test]
+    fn scan_refreshes_recent_order_after_a_file_changes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("edited.md");
+        fs::write(&path, "first note").unwrap();
+        fs::write(dir.path().join("other.md"), "second note").unwrap();
+        let later = SystemTime::now() + Duration::from_secs(60);
+        fs::File::options().write(true).open(&path).unwrap()
+            .set_times(fs::FileTimes::new().set_modified(later)).unwrap();
+        let library = scan(&[dir.path().to_path_buf()]);
+        let recent = recent_notes(&library);
+        assert_eq!(recent[0].path, path);
+        assert_eq!(recent[0].modified, Some(later));
+        assert_eq!(recent[0].created, fs::metadata(&path).unwrap().created().ok());
+    }
 
     #[test]
     fn scan_finds_markdown_and_skips_hidden_folders() {

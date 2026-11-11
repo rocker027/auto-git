@@ -57,8 +57,9 @@ pub struct NoteSyncApp {
     folder_error: String,
     pending: Option<Pending>,
     may_close: bool,
-    /// Folders whose notes are hidden in the list.
-    collapsed: HashSet<PathBuf>,
+    /// Folders explicitly opened by the user; all start collapsed.
+    expanded: HashSet<PathBuf>,
+    recent_open: bool,
     /// Editor, rendered Markdown, or backed-up versions of the open note.
     mode: ViewMode,
     /// The editor was shown last frame; when it comes back it gets the focus back.
@@ -107,7 +108,8 @@ impl NoteSyncApp {
             pending: None,
             may_close: false,
             clear_undo: false,
-            collapsed: HashSet::new(),
+            expanded: HashSet::new(),
+            recent_open: true,
             mode: ViewMode::Edit,
             was_editing: true,
             history: HistoryPanel::default(),
@@ -189,7 +191,7 @@ impl NoteSyncApp {
     }
 
     fn remove_folder(&mut self, path: &Path) {
-        self.collapsed.remove(path);
+        self.expanded.remove(path);
         self.update_folders(|cfg| cfg.remove_folder(path));
     }
 
@@ -462,6 +464,13 @@ impl NoteSyncApp {
         let mut removed = None;
         let mut toggled = None;
         let mut shown = 0;
+        if query.is_empty() {
+            let mut recent_open = self.recent_open;
+            chosen = widgets::recent_notes(ui, &self.library, &mut recent_open, |ui, note| {
+                self.note_row(ui, &note.path, &note.title, note.updated_at())
+            });
+            self.recent_open = recent_open;
+        }
         for group in &self.library {
             let matching: Vec<_> = group
                 .notes
@@ -472,7 +481,7 @@ impl NoteSyncApp {
                 continue;
             }
             shown += matching.len();
-            let is_open = is_folder_open(&self.collapsed, &group.folder, !query.is_empty());
+            let is_open = is_folder_open(&self.expanded, &group.folder, !query.is_empty());
             let header = widgets::folder_header(ui, &folder_label(&group.folder, &folders), is_open);
             if header.clicked() && query.is_empty() {
                 toggled = Some(group.folder.clone());
@@ -496,8 +505,8 @@ impl NoteSyncApp {
             ui.add_space(if is_open { 10.0 } else { 2.0 });
         }
         if let Some(folder) = toggled {
-            if !self.collapsed.remove(&folder) {
-                self.collapsed.insert(folder);
+            if !self.expanded.remove(&folder) {
+                self.expanded.insert(folder);
             }
         }
         shown += self.show_extra_hits(ui, &mut chosen);
@@ -528,7 +537,8 @@ impl NoteSyncApp {
             .map(status::time_ago)
             .unwrap_or_default();
         let row = widgets::note_row(ui, &title, &meta, open.is_some());
-        row.clicked()
+        widgets::note_context_menu(&row, path);
+        row.on_hover_text(path.display().to_string()).clicked()
     }
 
     fn show_extra_hits(&self, ui: &mut egui::Ui, chosen: &mut Option<PathBuf>) -> usize {
@@ -762,8 +772,8 @@ impl eframe::App for NoteSyncApp {
 }
 
 /// Searching always shows matches, even inside folders the user closed.
-fn is_folder_open(collapsed: &HashSet<PathBuf>, folder: &Path, is_searching: bool) -> bool {
-    is_searching || !collapsed.contains(folder)
+fn is_folder_open(expanded: &HashSet<PathBuf>, folder: &Path, is_searching: bool) -> bool {
+    is_searching || expanded.contains(folder)
 }
 
 #[cfg(test)]
@@ -773,10 +783,10 @@ mod tests {
     #[test]
     fn closed_folders_open_while_searching() {
         let notes = PathBuf::from("/n");
-        let closed: HashSet<PathBuf> = [notes.clone()].into();
-        assert!(!is_folder_open(&closed, &notes, false));
-        assert!(is_folder_open(&closed, &notes, true));
-        assert!(is_folder_open(&HashSet::new(), &notes, false));
+        let expanded: HashSet<PathBuf> = [notes.clone()].into();
+        assert!(is_folder_open(&expanded, &notes, false));
+        assert!(!is_folder_open(&HashSet::new(), &notes, false));
+        assert!(is_folder_open(&HashSet::new(), &notes, true));
     }
 
 }

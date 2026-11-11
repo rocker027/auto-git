@@ -9,6 +9,57 @@ const ROW_HEIGHT: f32 = 32.0;
 const ROW_PADDING: f32 = 10.0;
 const CORNER: f32 = 6.0;
 
+/// Shared by recent notes, folder rows and search results; right-click never opens the note.
+pub fn note_context_menu(row: &Response, path: &std::path::Path) {
+    row.context_menu(|ui| {
+        let error_id = egui::Id::new(("note-finder-error", path));
+        if ui.button("複製筆記路徑").clicked() {
+            ui.ctx().copy_text(path.to_string_lossy().into_owned());
+            ui.close_menu();
+        }
+        if ui.button("在 Finder 中顯示").clicked() {
+            match crate::platform::reveal_in_finder(path) {
+                Ok(()) => {
+                    ui.data_mut(|memory| memory.remove::<String>(error_id));
+                    ui.close_menu();
+                }
+                Err(error) => ui.data_mut(|memory| memory.insert_temp(error_id, error)),
+            }
+        }
+        if let Some(error) = ui.data(|memory| memory.get_temp::<String>(error_id)) {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+    });
+}
+
+/// A virtual group using the same header and note actions as watched folders.
+pub fn recent_notes(
+    ui: &mut Ui,
+    library: &[crate::notes::FolderNotes],
+    is_open: &mut bool,
+    mut row: impl FnMut(&mut Ui, &crate::notes::Note) -> bool,
+) -> Option<std::path::PathBuf> {
+    let mut chosen = None;
+    ui.push_id("recent-notes", |ui| {
+        if folder_header(ui, "最近更新", *is_open).clicked() {
+            *is_open = !*is_open;
+        }
+        if *is_open {
+            let notes = crate::notes::recent_notes(library);
+            if notes.is_empty() {
+                ui.weak("尚無筆記");
+            }
+            for note in notes {
+                if row(ui, note) {
+                    chosen = Some(note.path.clone());
+                }
+            }
+        }
+        ui.add_space(if *is_open { 10.0 } else { 2.0 });
+    });
+    chosen
+}
+
 /// Larger text and roomier controls than the egui defaults, in light and dark mode.
 pub fn apply_style(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
@@ -125,4 +176,51 @@ fn single_line(text: &str, font: FontId, color: Color32, width: f32) -> LayoutJo
     let mut job = LayoutJob::simple_singleline(text.to_owned(), font, color);
     job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(24.0));
     job
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_header_collapses_and_reopens_without_changing_note_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("test.md");
+        std::fs::write(&note, "test").unwrap();
+        let library = crate::notes::scan(&[dir.path().to_path_buf()]);
+        let ctx = egui::Context::default();
+        let mut open = true;
+        let mut header = egui::Pos2::ZERO;
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut rows = 0;
+            let mut chosen = None;
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(300.0, 300.0))),
+                events, ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    header = ui.cursor().min + vec2(20.0, 13.0);
+                    chosen = recent_notes(ui, &library, &mut open, |_, _| {
+                        rows += 1;
+                        true
+                    });
+                });
+            });
+            (rows, chosen, open, header)
+        };
+        let (rows, chosen, _, header) = frame(vec![]);
+        assert_eq!(rows, 1);
+        assert_eq!(chosen, Some(note.clone()));
+        let click = || vec![
+            egui::Event::PointerMoved(header),
+            egui::Event::PointerButton { pos: header, button: egui::PointerButton::Primary,
+                pressed: true, modifiers: egui::Modifiers::NONE },
+            egui::Event::PointerButton { pos: header, button: egui::PointerButton::Primary,
+                pressed: false, modifiers: egui::Modifiers::NONE },
+        ];
+        let (rows, chosen, open, _) = frame(click());
+        assert_eq!((rows, chosen, open), (0, None, false));
+        let (rows, chosen, open, _) = frame(click());
+        assert_eq!((rows, chosen, open), (1, Some(note), true));
+    }
 }
