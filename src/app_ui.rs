@@ -137,9 +137,10 @@ impl NoteSyncApp {
             return;
         }
         let folders = self.folders();
+        let previous = self.library.clone();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = sender.send(notes::scan(&folders));
+            let _ = sender.send(notes::scan_reusing(&folders, &previous));
         });
         self.scan = Some(receiver);
         self.last_scan = Instant::now();

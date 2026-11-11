@@ -113,13 +113,13 @@ fn make_app_menu() -> (Option<Menu>, MenuItem) {
 }
 
 fn install_cjk_fallback(ctx: &egui::Context) {
-    let Some(bytes) = note_sync::platform::cjk_font_bytes() else {
+    let Some(bytes) = note_sync::platform::shared_cjk_font() else {
         return;
     };
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "cjk".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        std::sync::Arc::new(egui::FontData::from_static(bytes)),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         if let Some(list) = fonts.families.get_mut(&family) {
@@ -127,12 +127,12 @@ fn install_cjk_fallback(ctx: &egui::Context) {
         }
     }
     // Use locally installed macOS fonts; no system font is bundled or redistributed.
-    for (name, path, family) in [
-        ("macos-ui", "/System/Library/Fonts/SFNS.ttf", egui::FontFamily::Proportional),
-        ("macos-mono", "/System/Library/Fonts/SFNSMono.ttf", egui::FontFamily::Monospace),
+    for (name, bytes, family) in [
+        ("macos-ui", note_sync::platform::shared_system_ui_font(), egui::FontFamily::Proportional),
+        ("macos-mono", note_sync::platform::shared_system_mono_font(), egui::FontFamily::Monospace),
     ] {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert(name.into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        if let Some(bytes) = bytes {
+            fonts.font_data.insert(name.into(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
             fonts.families.entry(family).or_default().insert(0, name.into());
         }
     }

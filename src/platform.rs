@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const CJK_FONT_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
@@ -12,6 +13,22 @@ pub fn cjk_font_bytes() -> Option<Vec<u8>> {
     CJK_FONT_CANDIDATES
         .iter()
         .find_map(|path| fs::read(path).ok())
+}
+
+/// Keep one immutable copy so egui can borrow it instead of cloning each font.
+pub fn shared_cjk_font() -> Option<&'static [u8]> {
+    static FONT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    FONT.get_or_init(cjk_font_bytes).as_deref()
+}
+
+pub fn shared_system_ui_font() -> Option<&'static [u8]> {
+    static FONT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    FONT.get_or_init(|| fs::read("/System/Library/Fonts/SFNS.ttf").ok()).as_deref()
+}
+
+pub fn shared_system_mono_font() -> Option<&'static [u8]> {
+    static FONT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    FONT.get_or_init(|| fs::read("/System/Library/Fonts/SFNSMono.ttf").ok()).as_deref()
 }
 
 /// Reveal the note in Finder, without opening it in another editor.
@@ -49,6 +66,16 @@ pub fn choose_folder() -> Result<Option<PathBuf>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_bytes_are_shared_across_requests() {
+        if !cfg!(target_os = "macos") { return; }
+        let first = shared_cjk_font().unwrap();
+        let second = shared_cjk_font().unwrap();
+        assert!(std::ptr::eq(first, second));
+        let data = eframe::egui::FontData::from_static(first);
+        assert!(matches!(data.font, std::borrow::Cow::Borrowed(_)));
+    }
 
     #[test]
     fn cjk_fallback_font_is_on_this_mac() {

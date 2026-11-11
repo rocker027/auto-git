@@ -1,8 +1,10 @@
 //! Lists Markdown notes inside the watched folders and filters them for search.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 const MAX_NOTES_PER_FOLDER: usize = 5000;
@@ -16,7 +18,7 @@ pub struct Note {
     pub modified: Option<SystemTime>,
     pub created: Option<SystemTime>,
     /// Lower-cased file text used for search.
-    haystack: String,
+    haystack: Arc<str>,
 }
 
 impl Note {
@@ -44,13 +46,23 @@ pub struct FolderNotes {
 }
 
 pub fn scan(folders: &[PathBuf]) -> Vec<FolderNotes> {
+    scan_reusing(folders, &[])
+}
+
+/// Read fresh contents on every scan, sharing unchanged search text with the visible list.
+/// Metadata alone cannot detect every edit (for example, same-size writes with restored mtime).
+pub fn scan_reusing(folders: &[PathBuf], previous: &[FolderNotes]) -> Vec<FolderNotes> {
+    let previous: HashMap<&Path, &Arc<str>> = previous.iter()
+        .flat_map(|group| &group.notes)
+        .map(|note| (note.path.as_path(), &note.haystack))
+        .collect();
     folders
         .iter()
         .map(|folder| {
             let mut notes = Vec::new();
             let exists = folder.is_dir();
             if exists {
-                walk(folder, &mut notes);
+                walk(folder, &mut notes, &previous);
             }
             notes.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.title.cmp(&b.title)));
             FolderNotes {
@@ -62,7 +74,7 @@ pub fn scan(folders: &[PathBuf]) -> Vec<FolderNotes> {
         .collect()
 }
 
-fn walk(dir: &Path, notes: &mut Vec<Note>) {
+fn walk(dir: &Path, notes: &mut Vec<Note>, previous: &HashMap<&Path, &Arc<str>>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -80,10 +92,11 @@ fn walk(dir: &Path, notes: &mut Vec<Note>) {
         };
         if kind.is_dir() {
             if !SKIPPED_DIRS.contains(&name.as_str()) {
-                walk(&path, notes);
+                walk(&path, notes, previous);
             }
         } else if kind.is_file() && is_markdown(&path) {
-            notes.push(read_note(path));
+            let old_text = previous.get(path.as_path()).copied();
+            notes.push(read_note(path, old_text));
         }
     }
 }
@@ -95,14 +108,22 @@ fn is_markdown(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn read_note(path: PathBuf) -> Note {
+fn read_note(path: PathBuf, previous: Option<&Arc<str>>) -> Note {
     let metadata = fs::metadata(&path).ok();
     let modified = metadata.as_ref().and_then(|m| m.modified().ok());
     let created = metadata.as_ref().and_then(|m| m.created().ok());
-    let mut text = fs::read(&path).unwrap_or_default();
-    text.truncate(MAX_INDEXED_BYTES);
+    // Bound the read itself, not only the retained prefix of a potentially huge file.
+    let mut text = Vec::new();
+    if fs::File::open(&path)
+        .and_then(|file| file.take(MAX_INDEXED_BYTES as u64).read_to_end(&mut text)).is_err() {
+        text.clear();
+    }
     let title = note_title(&path);
     let haystack = format!("{}\n{}", title, String::from_utf8_lossy(&text)).to_lowercase();
+    let haystack = match previous {
+        Some(previous) if previous.as_ref() == haystack => Arc::clone(previous),
+        _ => Arc::from(haystack),
+    };
     Note {
         path,
         title,
@@ -146,7 +167,7 @@ mod tests {
         let at = |seconds| UNIX_EPOCH + Duration::from_secs(seconds);
         Note {
             path: PathBuf::from(path), title: note_title(Path::new(path)),
-            created: created.map(at), modified: modified.map(at), haystack: String::new(),
+            created: created.map(at), modified: modified.map(at), haystack: Arc::from(""),
         }
     }
 
@@ -232,11 +253,48 @@ mod tests {
     }
 
     #[test]
+    fn rescans_share_unchanged_text_but_detect_edits_with_identical_metadata() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, "Milk 雞蛋").unwrap();
+        let roots = [dir.path().to_path_buf()];
+        let first = scan(&roots);
+        let cloned = first.clone();
+        let second = scan_reusing(&roots, &cloned);
+        assert!(Arc::ptr_eq(&first[0].notes[0].haystack, &second[0].notes[0].haystack));
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, "Rice 雞蛋").unwrap();
+        fs::File::options().write(true).open(&path).unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime)).unwrap();
+        let third = scan_reusing(&roots, &second);
+        assert!(!Arc::ptr_eq(&second[0].notes[0].haystack, &third[0].notes[0].haystack));
+        assert!(matches(&third[0].notes[0], &search_words("rice 雞蛋")));
+        assert!(!matches(&third[0].notes[0], &search_words("milk")));
+        assert!(matches(&first[0].notes[0], &search_words("milk")), "visible snapshot is immutable");
+        fs::remove_file(&path).unwrap();
+        assert!(scan_reusing(&roots, &third)[0].notes.is_empty());
+        assert!(scan_reusing(&[], &third).is_empty());
+    }
+
+    #[test]
+    fn indexing_keeps_the_same_prefix_limit_and_lossy_utf8_behavior() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.md");
+        let mut bytes = vec![b'a'; MAX_INDEXED_BYTES - 1];
+        bytes.extend_from_slice("雞outsideprefix".as_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let note = read_note(path, None);
+        assert!(note.haystack.ends_with('\u{fffd}'));
+        assert!(!matches(&note, &search_words("outsideprefix")));
+        assert!(matches(&note, &search_words("large")));
+    }
+
+    #[test]
     fn matches_needs_every_word_in_title_or_text() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("Shopping.md");
         fs::write(&path, "Milk and 雞蛋").unwrap();
-        let note = read_note(path);
+        let note = read_note(path, None);
         assert!(matches(&note, &search_words("shopping")));
         assert!(matches(&note, &search_words("MILK 雞蛋")));
         assert!(matches(&note, &search_words("")));
