@@ -37,7 +37,7 @@ impl HistoryPanel {
         }
         match &self.versions {
             Some(Err(HistoryError::NoVersions)) | None => {
-                ui.weak("還沒有備份過的版本。自動備份建立版本後，就會出現在這裡。");
+                crate::widgets::secondary_label(ui, "還沒有備份過的版本。自動備份建立版本後，就會出現在這裡。");
                 return None;
             }
             Some(Err(HistoryError::Failed(raw))) => {
@@ -48,8 +48,8 @@ impl HistoryPanel {
         }
         let mut saved = None;
         ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
             self.show_version_list(ui, note, git);
-            ui.separator();
             ui.vertical(|ui| saved = self.show_selected(ui, note, can_write));
         });
         saved
@@ -87,12 +87,15 @@ impl HistoryPanel {
         let mut clicked = None;
         ui.vertical(|ui| {
             ui.set_width(LIST_WIDTH);
-            ui.label(RichText::new("只列出已備份的版本，不含改名前的").small().weak());
+            let caption = RichText::new("只列出已備份的版本，不含改名前的").small();
+            ui.label(caption.color(crate::widgets::secondary_color(ui)));
             egui::ScrollArea::vertical().id_salt("history-list").show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 for (index, version) in versions.iter().enumerate() {
                     let age = time_ago(now.duration_since(version.committed_at).unwrap_or_default());
-                    let label = format!("{}\n{age}", version.when);
-                    if ui.selectable_label(self.selected == Some(index), label).clicked() {
+                    // Same two-line row as the note list: when it was made, then how long ago.
+                    let row = crate::widgets::note_row(ui, &version.when, &age, self.selected == Some(index));
+                    if row.clicked() {
                         clicked = Some(index);
                     }
                 }
@@ -118,7 +121,8 @@ impl HistoryPanel {
         };
         let when = self.selected_when().unwrap_or_default();
         let mut saved = None;
-        ui.horizontal(|ui| {
+        // Wrapped: in a narrow window the two buttons do not fit on one line.
+        ui.horizontal_wrapped(|ui| {
             if ui.button("複製內容").clicked() {
                 ui.ctx().copy_text(text.clone());
                 self.notice = "已複製到剪貼簿".into();
@@ -133,7 +137,7 @@ impl HistoryPanel {
                     Err(err) => self.notice = format!("另存失敗：{err:#}"),
                 }
             }
-            ui.weak(&self.notice);
+            crate::widgets::secondary_label(ui, &self.notice);
         });
         show_read_only(ui, text);
         saved
@@ -161,4 +165,36 @@ fn show_read_only(ui: &mut egui::Ui, text: &str) {
                     .font(egui::FontId::proportional(16.0)),
             );
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Width left for the chosen version at the smallest window, 640×420.
+    const NARROW_COLUMN: f32 = 150.0;
+
+    #[test]
+    fn the_actions_of_a_version_wrap_instead_of_running_past_a_narrow_column() {
+        let ctx = egui::Context::default();
+        crate::theme::apply_style(&ctx);
+        let mut panel = HistoryPanel {
+            shown: Some(Ok("old text".to_string())),
+            ..HistoryPanel::default()
+        };
+        let mut used = egui::Rect::NOTHING;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(NARROW_COLUMN, 400.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new())
+                .show(ctx, |ui| {
+                    let _ = panel.show_selected(ui, Path::new("/n/a.md"), true);
+                    used = ui.min_rect();
+                });
+        });
+        assert!(used.right() <= NARROW_COLUMN + 0.5, "{used:?}");
+    }
 }

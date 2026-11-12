@@ -55,7 +55,7 @@ pub fn backup_status(state: &BackupState, now: SystemTime) -> StatusLine {
         return StatusLine {
             tone: Tone::Quiet,
             text: "◔ 已存檔，等下次備份".into(),
-            detail: Some("下次自動備份時會建立版本。要馬上建立，請按 ⋯ →「立即備份」。".into()),
+            detail: Some("下次自動備份時會建立版本。要馬上建立，請按「備份」分頁的「立即備份」。".into()),
         };
     }
     backed_up_line(report, now)

@@ -1,5 +1,6 @@
 pub mod app_ui;
 pub mod config;
+pub mod controls;
 pub mod editor;
 pub mod editor_view;
 pub mod extra_search;
@@ -14,6 +15,8 @@ pub mod push_status;
 pub mod qmd_ops;
 pub mod scheduler;
 pub mod status;
+pub mod tab_bar;
+pub mod theme;
 pub mod tray_status;
 pub mod widgets;
 pub mod window_life;

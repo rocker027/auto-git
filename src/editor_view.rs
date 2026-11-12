@@ -17,20 +17,11 @@ pub enum ViewMode {
 pub fn show_editor_header(ui: &mut egui::Ui, editor: &OpenNote, mode: &mut ViewMode) {
     ui.add(egui::Label::new(RichText::new(notes::note_title(&editor.path)).heading().strong()).truncate())
         .on_hover_text(editor.path.display().to_string());
-    ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
-        egui::Frame::new()
-            .fill(ui.visuals().faint_bg_color)
-            .corner_radius(7.0)
-            .inner_margin(3.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| show_mode_switch(ui, mode));
-            });
-        ui.add_space(8.0);
+        show_mode_switch(ui, mode);
+        ui.add_space(4.0);
         ui.label(RichText::new(if editor.is_dirty() { "編輯中" } else { "已儲存" }).small().color(crate::widgets::secondary_color(ui)));
     });
-    ui.add_space(8.0);
-    ui.separator();
     if !editor.error.is_empty() {
         ui.colored_label(ui.visuals().error_fg_color, &editor.error);
     }
@@ -40,20 +31,12 @@ pub fn show_editor_header(ui: &mut egui::Ui, editor: &OpenNote, mode: &mut ViewM
 /// 編輯｜預覽｜歷史 switch; ⌘E flips between 編輯 and 預覽.
 /// Kept separate from the title so every mode stays reachable in narrow windows.
 fn show_mode_switch(ui: &mut egui::Ui, mode: &mut ViewMode) {
-    ui.spacing_mut().item_spacing.x = 2.0;
-    let dark = ui.visuals().dark_mode;
-    ui.visuals_mut().selection.bg_fill = if dark { egui::Color32::from_gray(88) } else { egui::Color32::WHITE };
-    ui.visuals_mut().selection.stroke.color = ui.visuals().text_color();
     let segments = [
         (ViewMode::Edit, "編輯", "⌘E"),
         (ViewMode::Preview, "預覽", "⌘E"),
         (ViewMode::History, "歷史", "已備份的版本"),
     ];
-    for (segment, label, hint) in segments {
-        if ui.selectable_label(*mode == segment, label).on_hover_text(hint).clicked() {
-            *mode = segment;
-        }
-    }
+    crate::controls::segmented(ui, mode, &segments);
 }
 
 /// ⌘E: 編輯 ↔ 預覽; from 歷史 it goes back to 編輯.
@@ -90,6 +73,10 @@ pub fn show_text_editor(ui: &mut egui::Ui, editor: &mut OpenNote, editor_id: Id)
 
 /// Larger notes are not rendered: the viewer lays out the whole text every frame.
 const PREVIEW_MAX_BYTES: usize = 100_000;
+/// Least height of a line, task box or table row in the preview.
+const PREVIEW_ROW_HEIGHT: f32 = 28.0;
+/// Largest heading in the preview; the app's own titles are larger.
+const PREVIEW_HEADING_SIZE: f32 = 22.0;
 
 /// Rendered Markdown of the open note. Read only.
 /// Returns the non-web links clicked this frame; they are not opened here.
@@ -99,7 +86,7 @@ pub fn show_preview(
     cache: &mut egui_commonmark::CommonMarkCache,
 ) -> Vec<String> {
     if text.len() > PREVIEW_MAX_BYTES {
-        ui.weak("筆記太大，請用編輯模式");
+        crate::widgets::secondary_label(ui, "筆記太大，請用編輯模式");
         return Vec::new();
     }
     ui.style_mut().url_in_tooltip = true;
@@ -109,13 +96,28 @@ pub fn show_preview(
         .auto_shrink([false, false])
         .show_viewport(ui, |ui, viewport| {
             ui.set_width(viewport.width());
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            ui.spacing_mut().item_spacing.y = 8.0;
-            egui_commonmark::CommonMarkViewer::new()
-                .max_image_width(Some(viewport.width() as usize))
-                .show(ui, cache, text);
+            show_markdown(ui, cache, text, viewport.width());
         });
     take_local_links(ui.ctx(), before)
+}
+
+/// The rendered note. It is content, not controls: lines, task boxes and table rows
+/// are sized by their text here, not by the touch height the rest of the app uses.
+fn show_markdown(
+    ui: &mut egui::Ui,
+    cache: &mut egui_commonmark::CommonMarkCache,
+    text: &str,
+    width: f32,
+) {
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+    ui.spacing_mut().item_spacing.y = 8.0;
+    ui.spacing_mut().interact_size.y = PREVIEW_ROW_HEIGHT;
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Heading, egui::FontId::proportional(PREVIEW_HEADING_SIZE));
+    egui_commonmark::CommonMarkViewer::new()
+        .max_image_width(Some(width as usize))
+        .show(ui, cache, text);
 }
 
 /// Keeps web and mail links for the system; pulls every other link the preview
@@ -206,9 +208,9 @@ pub fn resolve_note_link(note: &std::path::Path, url: &str) -> Option<std::path:
 pub fn show_conflict_banner(ui: &mut egui::Ui) -> bool {
     let mut reload = false;
     egui::Frame::new()
-        .fill(ui.visuals().warn_fg_color.gamma_multiply(0.15))
-        .corner_radius(6.0)
-        .inner_margin(10.0)
+        .fill(crate::theme::tint(ui.visuals().warn_fg_color, ui))
+        .corner_radius(crate::theme::CONTROL_RADIUS)
+        .inner_margin(12.0)
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("⚠ 這則筆記在別的地方被改過了");
@@ -279,6 +281,36 @@ mod tests {
         );
         fs::write(dir.path().join("run.sh"), "echo").unwrap();
         assert_eq!(resolve_note_link(&note, "run.sh"), None);
+    }
+
+    /// Height the preview takes for `text` under the app's style.
+    fn preview_height(text: &str) -> f32 {
+        let ctx = egui::Context::default();
+        crate::theme::apply_style(&ctx);
+        let mut cache = egui_commonmark::CommonMarkCache::default();
+        let mut height = 0.0;
+        // Twice: the viewer measures some rows on the first frame and places them on the next.
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let top = ui.cursor().min.y;
+                    show_markdown(ui, &mut cache, text, 600.0);
+                    height = ui.cursor().min.y - top;
+                });
+            });
+        }
+        height
+    }
+
+    #[test]
+    fn preview_rows_are_sized_by_their_text_not_by_the_touch_height() {
+        let touch = crate::theme::TOUCH;
+        let tasks = preview_height("- [ ] one\n- [x] two\n- [ ] three\n- [ ] four\n");
+        assert!(tasks > 40.0 && tasks < touch * 4.0, "task list: {tasks}");
+        let table = preview_height("| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n| 5 | 6 |\n");
+        assert!(table > 40.0 && table < touch * 4.0, "table of four rows: {table}");
+        let lines = preview_height("one\n\ntwo\n\nthree\n\nfour\n");
+        assert!(lines > 40.0 && lines < touch * 4.0, "four paragraphs: {lines}");
     }
 
     #[test]

@@ -2,12 +2,11 @@
 
 use crate::config::AppConfig;
 use crate::editor::OpenNote;
-use crate::labels::{folder_label, hit_label};
 use crate::extra_search::{ExtraSearch, QmdSettings};
 use crate::notes::{self, FolderNotes};
-use crate::qmd_ops::SearchHit;
 use crate::scheduler::Scheduler;
-use crate::status::{self, BackupState, Tone};
+use crate::tab_bar::{tab_after_keys, Tab, TabKeys};
+use crate::theme::{self, CARD_RADIUS, TOUCH};
 use crate::editor_view::{
     forget_undo, resolve_note_link, show_conflict_banner, show_editor_header, show_preview,
     show_text_editor, toggled_mode, ViewMode,
@@ -16,7 +15,7 @@ use crate::history_view::HistoryPanel;
 use crate::platform::choose_folder;
 use crate::widgets;
 use crate::window_life::{self, CloseAction};
-use eframe::egui::{self, Id, RichText};
+use eframe::egui::{self, Id};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,10 +23,14 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-mod main_menu;
+mod backup_tab;
+mod sidebar;
 
 const RESCAN_EVERY: Duration = Duration::from_secs(10);
 const SEARCH_ID: &str = "note-search";
+/// One gutter on every side; the right side shares it with the document's left margin.
+const SIDEBAR_MARGIN: egui::Margin = egui::Margin { left: 12, right: 8, top: 12, bottom: 12 };
+const DIALOG_TITLE_SIZE: f32 = 20.0;
 
 /// Something waiting on the "save first?" question.
 enum Pending {
@@ -62,6 +65,8 @@ pub struct NoteSyncApp {
     /// Folders explicitly opened by the user; all start collapsed.
     expanded: HashSet<PathBuf>,
     recent_open: bool,
+    /// Which tab the sidebar shows.
+    tab: Tab,
     /// Editor, rendered Markdown, or backed-up versions of the open note.
     mode: ViewMode,
     /// The editor was shown last frame; when it comes back it gets the focus back.
@@ -112,6 +117,7 @@ impl NoteSyncApp {
             clear_undo: false,
             expanded: HashSet::new(),
             recent_open: true,
+            tab: Tab::Notes,
             mode: ViewMode::Edit,
             was_editing: true,
             history: HistoryPanel::default(),
@@ -327,13 +333,20 @@ impl NoteSyncApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (save, find, toggle_preview) = ctx.input_mut(|input| {
+        let command = egui::Modifiers::COMMAND;
+        let (save, toggle_preview, tab_keys) = ctx.input_mut(|input| {
             (
-                input.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
-                input.consume_key(egui::Modifiers::COMMAND, egui::Key::F),
-                input.consume_key(egui::Modifiers::COMMAND, egui::Key::E),
+                input.consume_key(command, egui::Key::S),
+                input.consume_key(command, egui::Key::E),
+                TabKeys {
+                    find: input.consume_key(command, egui::Key::F),
+                    notes: input.consume_key(command, egui::Key::Num1),
+                    backup: input.consume_key(command, egui::Key::Num2),
+                },
             )
         });
+        // Before the focus request below: the search field is only drawn in the notes tab.
+        self.tab = tab_after_keys(self.tab, tab_keys);
         if toggle_preview && self.editor.is_some() {
             self.mode = toggled_mode(self.mode);
         }
@@ -344,197 +357,8 @@ impl NoteSyncApp {
         if save && can_save {
             self.save();
         }
-        if find {
+        if tab_keys.find {
             ctx.memory_mut(|memory| memory.request_focus(Id::new(SEARCH_ID)));
-        }
-    }
-
-    // ---- sidebar ------------------------------------------------------------
-
-    fn show_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        self.show_search_field(ui);
-        ui.add_space(4.0);
-        if ui.add(egui::Button::new("＋ 加入資料夾").frame(false)).clicked() {
-            self.pick_and_add_folder();
-        }
-        self.show_status_row(ui);
-        ui.separator();
-        if !self.folder_error.is_empty() {
-            ui.colored_label(ui.visuals().error_fg_color, &self.folder_error);
-        }
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| self.show_note_list(ui));
-    }
-
-    fn show_status_row(&mut self, ui: &mut egui::Ui) {
-        let report = self.scheduler.last_report();
-        let state = BackupState {
-            report: report.as_ref(),
-            is_running: self.scheduler.is_running(),
-            is_pushing: self.scheduler.is_pushing(),
-            is_paused: self.scheduler.is_paused(),
-            editor_dirty: self.editor_dirty(),
-            last_saved_at: self.last_saved_at,
-        };
-        let line = status::backup_status(&state, SystemTime::now());
-        let is_problem = line.tone == Tone::Problem;
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.show_main_menu(ui);
-                let color = match line.tone {
-                    Tone::Good => widgets::secondary_color(ui),
-                    Tone::Quiet => widgets::secondary_color(ui),
-                    Tone::Problem => ui.visuals().error_fg_color,
-                };
-                if !is_problem {
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        let label = ui.add(egui::Label::new(RichText::new(&line.text).small().color(color)).truncate());
-                        if let Some(detail) = &line.detail {
-                            label.on_hover_text(detail);
-                        }
-                    });
-                }
-            });
-        });
-        // Problems get their own wrapped line so the cause is never cut off.
-        if is_problem {
-            let label = ui.add(egui::Label::new(RichText::new(&line.text).color(ui.visuals().error_fg_color)).wrap());
-            if let Some(detail) = &line.detail {
-                label.on_hover_text(detail);
-            }
-        }
-    }
-
-    fn show_search_field(&mut self, ui: &mut egui::Ui) {
-        let field = egui::TextEdit::singleline(&mut self.query)
-            .id(Id::new(SEARCH_ID))
-            .hint_text("搜尋筆記")
-            .margin(egui::vec2(8.0, 6.0))
-            .desired_width(f32::INFINITY);
-        let response = ui.add(field).on_hover_text("搜尋名稱與內容 · ⌘F");
-        // egui drops focus on Esc in the same frame, so lost_focus counts too.
-        let was_focused = response.has_focus() || response.lost_focus();
-        if was_focused && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-            self.query.clear();
-        }
-        self.extra.set_query(&self.query);
-    }
-
-    fn show_note_list(&mut self, ui: &mut egui::Ui) {
-        let folders = self.folders();
-        let query = self.query.trim().to_string();
-        let words = notes::search_words(&query);
-        let mut chosen = None;
-        let mut removed = None;
-        let mut toggled = None;
-        let mut shown = 0;
-        if query.is_empty() {
-            let mut recent_open = self.recent_open;
-            chosen = widgets::recent_notes(ui, &self.library, &mut recent_open, |ui, note| {
-                self.note_row(ui, &note.path, &note.title, note.updated_at())
-            });
-            self.recent_open = recent_open;
-        }
-        for group in &self.library {
-            let matching: Vec<_> = group
-                .notes
-                .iter()
-                .filter(|note| notes::matches(note, &words))
-                .collect();
-            if !query.is_empty() && matching.is_empty() {
-                continue;
-            }
-            shown += matching.len();
-            let is_open = is_folder_open(&self.expanded, &group.folder, !query.is_empty());
-            let header = widgets::folder_header(ui, &folder_label(&group.folder, &folders), is_open);
-            if header.clicked() && query.is_empty() {
-                toggled = Some(group.folder.clone());
-            }
-            header.context_menu(|ui| {
-                if ui.button("移除這個資料夾").clicked() {
-                    removed = Some(group.folder.clone());
-                    ui.close_menu();
-                }
-            });
-            if !group.exists {
-                ui.colored_label(ui.visuals().error_fg_color, "  找不到這個資料夾");
-            }
-            if is_open {
-                for note in matching {
-                    if self.note_row(ui, &note.path, &note.title, note.modified) {
-                        chosen = Some(note.path.clone());
-                    }
-                }
-            }
-            ui.add_space(if is_open { 10.0 } else { 2.0 });
-        }
-        if let Some(folder) = toggled {
-            if !self.expanded.remove(&folder) {
-                self.expanded.insert(folder);
-            }
-        }
-        shown += self.show_extra_hits(ui, &mut chosen);
-        self.show_list_footer(ui, &query, shown);
-        if let Some(path) = chosen {
-            self.request_open(path);
-        }
-        if let Some(folder) = removed {
-            self.remove_folder(&folder);
-        }
-    }
-
-    /// Returns true when clicked.
-    fn note_row(
-        &self,
-        ui: &mut egui::Ui,
-        path: &Path,
-        title: &str,
-        modified: Option<SystemTime>,
-    ) -> bool {
-        let open = self.editor.as_ref().filter(|e| e.path == path);
-        let title = match open {
-            Some(editor) if editor.is_dirty() => format!("● {title}"),
-            _ => title.to_string(),
-        };
-        let meta = modified
-            .and_then(|at| SystemTime::now().duration_since(at).ok())
-            .map(status::time_ago)
-            .unwrap_or_default();
-        let row = widgets::note_row(ui, &title, &meta, open.is_some());
-        widgets::note_context_menu(&row, path);
-        row.on_hover_text(path.display().to_string()).clicked()
-    }
-
-    fn show_extra_hits(&self, ui: &mut egui::Ui, chosen: &mut Option<PathBuf>) -> usize {
-        let hits: Vec<&SearchHit> = self
-            .extra
-            .hits()
-            .iter()
-            .filter(|hit| !self.is_in_library(&hit.file))
-            .collect();
-        if hits.is_empty() {
-            return 0;
-        }
-        ui.label(RichText::new("其他地方").small().strong().weak());
-        let all: Vec<SearchHit> = hits.iter().map(|hit| (*hit).clone()).collect();
-        for hit in &hits {
-            if self.note_row(ui, &hit.file, &hit_label(hit, &all), None) {
-                *chosen = Some(hit.file.clone());
-            }
-        }
-        hits.len()
-    }
-
-    fn show_list_footer(&self, ui: &mut egui::Ui, query: &str, shown: usize) {
-        if !query.is_empty() && shown == 0 && !self.extra.is_busy() {
-            ui.add_space(24.0);
-            ui.vertical_centered(|ui| ui.weak("沒有符合的筆記"));
-        }
-        if let Some(failure) = &self.extra.failure {
-            ui.weak("其他地方的搜尋失敗").on_hover_text(failure);
         }
     }
 
@@ -550,7 +374,7 @@ impl NoteSyncApp {
                 ui.add_space((ui.available_height() * 0.35).max(24.0));
                 ui.heading("選擇一則筆記");
                 ui.add_space(8.0);
-                ui.weak("從左側列表選取，或按 ⌘F 搜尋。");
+                widgets::secondary_label(ui, "從左側列表選取，或按 ⌘F 搜尋。");
             });
             return;
         };
@@ -620,11 +444,11 @@ impl NoteSyncApp {
             ui.add_space((ui.available_height() / 2.0 - 60.0).max(24.0));
             ui.heading("你的筆記，集中在這裡");
             ui.add_space(8.0);
-            ui.weak("加入 Markdown 資料夾，即可編輯、搜尋與自動備份。");
+            widgets::secondary_label(ui, "加入 Markdown 資料夾，即可編輯、搜尋與自動備份。");
             ui.add_space(20.0);
             let button =
-                widgets::primary_button(ui, "選擇筆記資料夾…", 14.0).min_size(egui::vec2(180.0, 34.0));
-            if ui.add(button).clicked() {
+                widgets::primary_button("選擇筆記資料夾…", 15.0).min_size(egui::vec2(200.0, TOUCH));
+            if widgets::add_primary_button(ui, true, button).clicked() {
                 self.pick_and_add_folder();
             }
             if !self.folder_error.is_empty() {
@@ -658,15 +482,20 @@ impl NoteSyncApp {
         };
         let mut choice = None;
         // Only shown when saving failed; normal edits are saved on their own.
-        let modal = egui::Modal::new(Id::new("unsaved")).show(ctx, |ui| {
+        let frame = egui::Frame::popup(&ctx.style())
+            .inner_margin(20.0)
+            .corner_radius(CARD_RADIUS);
+        let modal = egui::Modal::new(Id::new("unsaved")).frame(frame).show(ctx, |ui| {
             ui.set_width(360.0);
-            ui.heading(format!("「{title}」存不進去"));
+            let heading = egui::RichText::new(format!("「{title}」存不進去")).size(DIALOG_TITLE_SIZE).strong();
+            ui.add(egui::Label::new(heading).wrap());
             if !reason.is_empty() {
                 ui.label(&reason);
             }
             ui.add_space(16.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if can_retry && ui.add(widgets::primary_button(ui, "再試一次", 15.0)).clicked() {
+                let retry = widgets::primary_button("再試一次", 15.0);
+                if can_retry && widgets::add_primary_button(ui, true, retry).clicked() {
                     choice = Some(Choice::Save);
                 }
                 if ui.button("放棄修改").clicked() {
@@ -705,6 +534,31 @@ impl NoteSyncApp {
     }
 }
 
+impl NoteSyncApp {
+    /// Sidebar and document sit on one background; the document is a raised card.
+    fn show_panels(&mut self, ctx: &egui::Context) {
+        let background = theme::palette(ctx.style().visuals.dark_mode).background;
+        egui::SidePanel::left("notes")
+            .resizable(true)
+            .default_width(280.0)
+            // Reserve room for the document; its controls wrap independently of the title.
+            .width_range(220.0..=(ctx.screen_rect().width() - 360.0).clamp(220.0, 520.0))
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(background).inner_margin(SIDEBAR_MARGIN))
+            .show(ctx, |ui| self.show_sidebar(ui));
+        // Left is narrower: with the sidebar's right margin it adds up to one gutter.
+        let around_document = egui::Margin { left: 4, right: 12, top: 12, bottom: 12 };
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(background).inner_margin(around_document))
+            .show(ctx, |ui| {
+                theme::card(ui).inner_margin(24.0).show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    self.show_editor(ui);
+                });
+            });
+    }
+}
+
 impl eframe::App for NoteSyncApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.menus.backup_status.refresh(self.scheduler.last_report().as_ref());
@@ -717,22 +571,7 @@ impl eframe::App for NoteSyncApp {
         if self.folders().is_empty() {
             egui::CentralPanel::default().show(ctx, |ui| self.show_welcome(ui));
         } else {
-            egui::SidePanel::left("notes")
-                .resizable(true)
-                .default_width(280.0)
-                // Reserve room for the document; its controls wrap independently of the title.
-                .width_range(220.0..=(ctx.screen_rect().width() - 360.0).clamp(220.0, 520.0))
-                .frame(egui::Frame::new()
-                    .fill(if ctx.style().visuals.dark_mode {
-                        egui::Color32::from_rgb(38, 38, 40)
-                    } else {
-                        egui::Color32::from_rgb(244, 244, 246)
-                    })
-                    .inner_margin(12.0))
-                .show(ctx, |ui| self.show_sidebar(ui));
-            egui::CentralPanel::default()
-                .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(24.0))
-                .show(ctx, |ui| self.show_editor(ui));
+            self.show_panels(ctx);
         }
         self.show_unsaved_dialog(ctx);
         self.autosave();

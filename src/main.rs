@@ -53,7 +53,7 @@ fn main() -> eframe::Result {
             *tray_c.borrow_mut() = tray;
 
             install_cjk_fallback(&cc.egui_ctx);
-            note_sync::widgets::apply_style(&cc.egui_ctx);
+            note_sync::theme::apply_style(&cc.egui_ctx);
             let (app_menu, app_quit) = make_app_menu();
             let quitting = Arc::new(AtomicBool::new(false));
             note_sync::window_life::install_menu_handler(

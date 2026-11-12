@@ -1,17 +1,18 @@
-//! Small custom widgets and the app-wide look.
+//! Rows of the note list: folder headers, note rows and their right-click menu.
 
+use crate::theme::{self, CONTROL_RADIUS, FOCUS_RING, ROW_RADIUS, TOUCH};
 use eframe::egui::{
-    self, pos2, text::LayoutJob, vec2, Color32, FontId, Response, Sense, StrokeKind, TextStyle,
-    Ui, WidgetInfo, WidgetType,
+    self, pos2, text::LayoutJob, vec2, Color32, FontId, Response, Sense, Stroke, StrokeKind,
+    TextStyle, Ui, WidgetInfo, WidgetType,
 };
 
-const ROW_HEIGHT: f32 = 50.0;
+const ROW_HEIGHT: f32 = 52.0;
 const ROW_PADDING: f32 = 10.0;
-const CORNER: f32 = 6.0;
 
 /// Shared by recent notes, folder rows and search results; right-click never opens the note.
 pub fn note_context_menu(row: &Response, path: &std::path::Path) {
     row.context_menu(|ui| {
+        theme::compact_menu(ui);
         let error_id = egui::Id::new(("note-finder-error", path));
         if ui.button("複製筆記路徑").clicked() {
             ui.ctx().copy_text(path.to_string_lossy().into_owned());
@@ -47,7 +48,7 @@ pub fn recent_notes(
         if *is_open {
             let notes = crate::notes::recent_notes(library);
             if notes.is_empty() {
-                ui.weak("尚無筆記");
+                secondary_label(ui, "尚無筆記");
             }
             for note in notes {
                 if row(ui, note) {
@@ -55,80 +56,53 @@ pub fn recent_notes(
                 }
             }
         }
-        ui.add_space(if *is_open { 10.0 } else { 2.0 });
     });
     chosen
 }
 
-/// Larger text and roomier controls than the egui defaults, in light and dark mode.
-pub fn apply_style(ctx: &egui::Context) {
-    ctx.all_styles_mut(|style| {
-        style.text_styles = [
-            (TextStyle::Heading, FontId::proportional(20.0)),
-            (TextStyle::Body, FontId::proportional(14.0)),
-            (TextStyle::Button, FontId::proportional(13.0)),
-            (TextStyle::Small, FontId::proportional(12.5)),
-            (TextStyle::Monospace, FontId::monospace(14.0)),
-        ]
-        .into();
-        style.spacing.button_padding = vec2(12.0, 6.0);
-        style.spacing.item_spacing = vec2(8.0, 6.0);
-        style.spacing.interact_size.y = 28.0;
-        let dark = style.visuals.dark_mode;
-        style.visuals.panel_fill = if dark { Color32::from_rgb(30, 30, 32) } else { Color32::WHITE };
-        style.visuals.extreme_bg_color = if dark { Color32::from_rgb(24, 24, 26) } else { Color32::WHITE };
-        style.visuals.selection.bg_fill = Color32::from_rgb(0, 92, 200);
-        style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::WHITE);
-        let foreground = if dark { Color32::from_gray(235) } else { Color32::from_gray(35) };
-        let control = if dark { Color32::from_gray(57) } else { Color32::from_gray(240) };
-        let hover = if dark { Color32::from_gray(72) } else { Color32::from_gray(225) };
-        let separator = if dark { Color32::from_gray(60) } else { Color32::from_gray(220) };
-        style.visuals.widgets.noninteractive.fg_stroke.color = foreground;
-        style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, separator);
-        for widget in [
-            &mut style.visuals.widgets.inactive,
-            &mut style.visuals.widgets.hovered,
-            &mut style.visuals.widgets.active,
-            &mut style.visuals.widgets.open,
-        ] {
-            widget.corner_radius = 6.0.into();
-            widget.bg_stroke = egui::Stroke::NONE;
-            widget.fg_stroke = egui::Stroke::new(1.0_f32, foreground);
-            widget.bg_fill = control;
-            widget.weak_bg_fill = control;
-        }
-        style.visuals.widgets.hovered.bg_fill = hover;
-        style.visuals.widgets.hovered.weak_bg_fill = hover;
-        // Keep a visible keyboard focus ring even on borderless controls.
-        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, style.visuals.selection.bg_fill);
-        style.visuals.widgets.active.bg_fill = hover;
-        style.visuals.widgets.active.weak_bg_fill = hover;
-        style.visuals.faint_bg_color = if dark { Color32::from_gray(38) } else { Color32::from_gray(246) };
-        style.visuals.code_bg_color = control;
-        style.visuals.window_fill = if dark { Color32::from_gray(42) } else { Color32::from_gray(250) };
-        style.visuals.window_stroke = egui::Stroke::new(1.0_f32, separator);
-        style.visuals.hyperlink_color = if dark { Color32::from_rgb(100, 180, 255) } else { Color32::from_rgb(0, 92, 200) };
-    });
-}
-
 /// Secondary information stays readable against the opaque sidebar and document surfaces.
 pub fn secondary_color(ui: &Ui) -> Color32 {
-    if ui.visuals().dark_mode { Color32::from_gray(170) } else { Color32::from_gray(100) }
+    theme::of(ui).secondary
 }
 
 /// The one action the current screen is about, drawn in the accent color.
-pub fn primary_button<'a>(ui: &Ui, text: &str, size: f32) -> egui::Button<'a> {
-    let visuals = ui.visuals();
-    let label = egui::RichText::new(text)
-        .size(size)
-        .strong()
-        .color(visuals.selection.stroke.color);
-    egui::Button::new(label).fill(visuals.selection.bg_fill)
+pub fn primary_button<'a>(text: &str, size: f32) -> egui::Button<'a> {
+    let label = egui::RichText::new(text).size(size).color(theme::ON_ACCENT);
+    egui::Button::new(label).fill(theme::ACCENT)
+}
+
+/// Adds a `primary_button`. Its focus ring is drawn inside, in the label colour:
+/// the app-wide accent ring would vanish against the accent fill.
+pub fn add_primary_button(ui: &mut Ui, is_enabled: bool, button: egui::Button<'_>) -> Response {
+    let response = ui.add_enabled(is_enabled, button);
+    if response.has_focus() {
+        let ring = Stroke::new(FOCUS_RING, theme::ON_ACCENT);
+        let inset = 3.0;
+        ui.painter().rect_stroke(
+            response.rect.shrink(inset),
+            f32::from(CONTROL_RADIUS) - inset,
+            ring,
+            StrokeKind::Inside,
+        );
+    }
+    response
+}
+
+/// Secondary text that stays readable; egui's own "weak" text is too faint on these surfaces.
+pub fn secondary_label(ui: &mut Ui, text: &str) -> Response {
+    ui.label(egui::RichText::new(text).color(secondary_color(ui)))
+}
+
+/// A secondary action as accent text. It keeps the button frame, so hover and
+/// keyboard focus still draw the ring.
+pub fn quiet_button<'a>(ui: &Ui, text: &str) -> egui::Button<'a> {
+    let label = egui::RichText::new(text).color(theme::of(ui).accent_text);
+    egui::Button::new(label).fill(Color32::TRANSPARENT)
 }
 
 /// Folder title in the note list. Click to show or hide its notes.
 pub fn folder_header(ui: &mut Ui, label: &str, is_open: bool) -> Response {
-    let size = vec2(ui.available_width(), 26.0);
+    let size = vec2(ui.available_width(), TOUCH);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     response.widget_info(|| {
         WidgetInfo::selected(WidgetType::CollapsingHeader, ui.is_enabled(), is_open, label)
@@ -136,29 +110,37 @@ pub fn folder_header(ui: &mut Ui, label: &str, is_open: bool) -> Response {
     if !ui.is_rect_visible(rect) {
         return response;
     }
-    if response.hovered() || response.has_focus() {
-        ui.painter()
-            .rect_filled(rect, CORNER, ui.visuals().widgets.hovered.weak_bg_fill);
+    if response.hovered() {
+        ui.painter().rect_filled(rect, ROW_RADIUS, theme::of(ui).hover);
     }
+    paint_focus_ring(ui, &response);
     let color = secondary_color(ui);
-    paint_disclosure(ui, pos2(rect.left() + 10.0, rect.center().y), is_open, color);
+    paint_chevron(ui, pos2(rect.left() + 14.0, rect.center().y), is_open, color);
     let font = FontId::proportional(13.0);
-    let galley = ui.fonts(|fonts| fonts.layout_job(single_line(label, font, color, rect.width() - 28.0)));
-    let pos = pos2(rect.left() + 22.0, rect.center().y - galley.size().y / 2.0);
+    let galley = ui.fonts(|fonts| fonts.layout_job(single_line(label, font, color, rect.width() - 38.0)));
+    let pos = pos2(rect.left() + 28.0, rect.center().y - galley.size().y / 2.0);
     ui.painter().galley(pos, galley, color);
     response
 }
 
-/// Solid triangle: pointing down when open, right when closed.
-fn paint_disclosure(ui: &Ui, center: egui::Pos2, is_open: bool, color: Color32) {
-    let r = 4.5;
+/// Thin chevron: pointing down when open, right when closed.
+pub fn paint_chevron(ui: &Ui, center: egui::Pos2, is_open: bool, color: Color32) {
+    let r = 4.0;
     let points = if is_open {
-        vec![center + vec2(-r, -r * 0.6), center + vec2(r, -r * 0.6), center + vec2(0.0, r * 0.7)]
+        vec![center + vec2(-r, -r * 0.5), center + vec2(0.0, r * 0.5), center + vec2(r, -r * 0.5)]
     } else {
-        vec![center + vec2(-r * 0.6, -r), center + vec2(r * 0.7, 0.0), center + vec2(-r * 0.6, r)]
+        vec![center + vec2(-r * 0.5, -r), center + vec2(r * 0.5, 0.0), center + vec2(-r * 0.5, r)]
     };
-    ui.painter()
-        .add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+    ui.painter().add(egui::Shape::line(points, Stroke::new(1.6_f32, color)));
+}
+
+/// Keyboard focus on a custom-painted row or tile.
+pub fn paint_focus_ring(ui: &Ui, response: &Response) {
+    if response.has_focus() {
+        let stroke = Stroke::new(FOCUS_RING, theme::of(ui).accent_text);
+        ui.painter()
+            .rect_stroke(response.rect.shrink(1.0), ROW_RADIUS, stroke, StrokeKind::Inside);
+    }
 }
 
 /// Two-line note row keeps titles readable in a narrow sidebar.
@@ -172,9 +154,9 @@ pub fn note_row(ui: &mut Ui, title: &str, meta: &str, selected: bool) -> Respons
         return response;
     }
     paint_row_background(ui, &response, selected);
-    let visuals = ui.style().interact_selectable(&response, selected);
-    let text_color = visuals.text_color();
-    let meta_color = if selected { text_color } else { secondary_color(ui) };
+    let colors = theme::of(ui);
+    let text_color = if selected { theme::ON_ACCENT } else { colors.text };
+    let meta_color = if selected { theme::ON_ACCENT } else { colors.secondary };
     let painter = ui.painter();
     let meta_galley =
         painter.layout_no_wrap(meta.to_owned(), TextStyle::Small.resolve(ui.style()), meta_color);
@@ -185,7 +167,7 @@ pub fn note_row(ui: &mut Ui, title: &str, meta: &str, selected: bool) -> Respons
     let title_pos = pos2(rect.left() + ROW_PADDING, rect.top() + 8.0);
     let meta_pos = pos2(
         rect.left() + ROW_PADDING,
-        rect.bottom() - meta_galley.size().y - 7.0,
+        rect.bottom() - meta_galley.size().y - 8.0,
     );
     painter.galley(title_pos, title_galley, text_color);
     painter.galley(meta_pos, meta_galley, meta_color);
@@ -193,22 +175,24 @@ pub fn note_row(ui: &mut Ui, title: &str, meta: &str, selected: bool) -> Respons
 }
 
 fn paint_row_background(ui: &Ui, response: &Response, selected: bool) {
-    let visuals = ui.visuals();
     let fill = if selected {
-        Some(visuals.selection.bg_fill)
+        Some(theme::ACCENT)
     } else if response.hovered() {
-        Some(visuals.widgets.hovered.weak_bg_fill)
+        Some(theme::of(ui).hover)
     } else {
         None
     };
     if let Some(fill) = fill {
-        ui.painter().rect_filled(response.rect, CORNER, fill);
+        ui.painter().rect_filled(response.rect, ROW_RADIUS, fill);
     }
-    if response.has_focus() {
-        let stroke = ui.visuals().widgets.hovered.fg_stroke;
-        ui.painter()
-            .rect_stroke(response.rect.shrink(1.0), CORNER, stroke, StrokeKind::Inside);
+    if !response.has_focus() {
+        return;
     }
+    // On the accent fill of the chosen row the ring is the text colour, so it still shows.
+    let color = if selected { theme::ON_ACCENT } else { theme::of(ui).accent_text };
+    let ring = Stroke::new(FOCUS_RING, color);
+    ui.painter()
+        .rect_stroke(response.rect.shrink(1.0), ROW_RADIUS, ring, StrokeKind::Inside);
 }
 
 fn single_line(text: &str, font: FontId, color: Color32, width: f32) -> LayoutJob {
