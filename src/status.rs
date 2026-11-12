@@ -1,6 +1,7 @@
 //! Turns backup state into one short line for the sidebar.
 
 use crate::git_ops::CommitOutcome;
+use crate::push_status::{folder_name, is_all_pushed, push_note, push_problem};
 use crate::scheduler::{BackupReport, FolderBackup};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -23,6 +24,8 @@ pub struct StatusLine {
 pub struct BackupState<'a> {
     pub report: Option<&'a BackupReport>,
     pub is_running: bool,
+    /// The versions are made; they are on their way to the remote.
+    pub is_pushing: bool,
     pub is_paused: bool,
     pub editor_dirty: bool,
     /// Last time the app wrote a note to disk.
@@ -35,6 +38,9 @@ pub fn backup_status(state: &BackupState, now: SystemTime) -> StatusLine {
     }
     if state.is_running {
         return line(Tone::Quiet, "↻ 正在備份…");
+    }
+    if state.is_pushing {
+        return line(Tone::Quiet, "↑ 正在推送…");
     }
     if state.is_paused {
         return line(Tone::Quiet, "‖ 自動備份已暫停");
@@ -62,14 +68,26 @@ fn backed_up_line(report: &BackupReport, now: SystemTime) -> StatusLine {
     match report.last_commit_at {
         Some(version) => StatusLine {
             tone: Tone::Good,
-            text: format!("✓ 已備份 · {}", age(version)),
-            detail: Some(format!("最新版本建立於 {}\n{checked}", age(version))),
+            text: format!("✓ {} · {}", backed_up_word(report), age(version)),
+            detail: Some(format!(
+                "最新版本建立於 {}\n{checked}{}",
+                age(version),
+                push_note(&report.pushes)
+            )),
         },
         None => StatusLine {
             tone: Tone::Good,
             text: format!("✓ 已檢查 · {}", age(report.finished_at)),
             detail: Some(format!("還沒有任何版本，沒有需要備份的檔案\n{checked}")),
         },
+    }
+}
+
+fn backed_up_word(report: &BackupReport) -> &'static str {
+    if is_all_pushed(&report.pushes) {
+        "已備份並推送"
+    } else {
+        "已備份"
     }
 }
 
@@ -86,6 +104,7 @@ fn first_problem(report: &BackupReport) -> Option<StatusLine> {
         .folders
         .iter()
         .filter_map(|(folder, result)| folder_problem(folder, result))
+        .chain(report.pushes.iter().filter_map(|(folder, push)| push_problem(folder, push)))
         .collect();
     let (text, _) = problems.first()?.clone();
     let detail = problems
@@ -102,10 +121,7 @@ fn first_problem(report: &BackupReport) -> Option<StatusLine> {
 
 /// Short text and full cause for a folder that was not backed up.
 fn folder_problem(folder: &Path, result: &FolderBackup) -> Option<(String, String)> {
-    let name = folder
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| folder.display().to_string());
+    let name = folder_name(folder);
     let path = folder.display();
     match result {
         FolderBackup::Done(CommitOutcome::Committed { .. } | CommitOutcome::SkippedNoChanges) => {
@@ -173,6 +189,7 @@ mod tests {
                 .map(|(p, r)| (PathBuf::from(p), r))
                 .collect(),
             last_commit_at: None,
+            pushes: Vec::new(),
         }
     }
 
@@ -180,6 +197,7 @@ mod tests {
         BackupState {
             report,
             is_running: false,
+            is_pushing: false,
             is_paused: false,
             editor_dirty: false,
             last_saved_at: None,
@@ -199,6 +217,59 @@ mod tests {
         assert_eq!(status.tone, Tone::Good);
         assert_eq!(status.text, "✓ 已備份 · 3 小時前");
         assert!(status.detail.unwrap().contains("最近檢查：1 分鐘前"));
+    }
+
+    #[test]
+    fn pushed_folders_change_the_word_and_the_hover_text() {
+        use crate::git_push::PushOutcome;
+        use crate::scheduler::FolderPush;
+        let now = SystemTime::now();
+        let mut done = report(
+            vec![("/n/Wiki", FolderBackup::Done(CommitOutcome::SkippedNoChanges))],
+            now - Duration::from_secs(60),
+        );
+        done.last_commit_at = Some(now - Duration::from_secs(120));
+        done.pushes = vec![(PathBuf::from("/n/Wiki"), FolderPush::Done(PushOutcome::UpToDate))];
+        let status = backup_status(&state(Some(&done)), now);
+        assert_eq!(status.text, "✓ 已備份並推送 · 2 分鐘前");
+        assert!(status.detail.unwrap().contains("「Wiki」已推送到遠端"));
+
+        done.pushes = vec![(PathBuf::from("/n/Wiki"), FolderPush::Done(PushOutcome::NoUpstream))];
+        let status = backup_status(&state(Some(&done)), now);
+        assert_eq!(status.text, "✓ 已備份 · 2 分鐘前", "nothing reached a remote");
+        assert!(status.detail.unwrap().contains("只備份在這台電腦"));
+    }
+
+    #[test]
+    fn failed_push_is_shown_after_backup_problems() {
+        use crate::scheduler::FolderPush;
+        let now = SystemTime::now();
+        let mut done = report(
+            vec![
+                ("/n/Wiki", FolderBackup::Done(CommitOutcome::SkippedNoChanges)),
+                ("/n/Work", FolderBackup::Missing),
+            ],
+            now,
+        );
+        let rejected = "git push failed: ! [rejected] HEAD -> main (fetch first)";
+        done.pushes = vec![(PathBuf::from("/n/Wiki"), FolderPush::Failed(rejected.into()))];
+        let status = backup_status(&state(Some(&done)), now);
+        assert_eq!(status.tone, Tone::Problem);
+        assert_eq!(status.text, "⚠ 找不到「Work」");
+        assert!(status.detail.unwrap().contains("fetch first"));
+
+        done.folders.pop();
+        let status = backup_status(&state(Some(&done)), now);
+        assert_eq!(status.text, "⚠ 「Wiki」的遠端有較新的版本，請先 git pull");
+    }
+
+    #[test]
+    fn pushing_is_shown_until_it_ends() {
+        let mut s = state(None);
+        s.is_pushing = true;
+        assert_eq!(backup_status(&s, SystemTime::now()).text, "↑ 正在推送…");
+        s.is_running = true;
+        assert_eq!(backup_status(&s, SystemTime::now()).text, "↻ 正在備份…");
     }
 
     #[test]

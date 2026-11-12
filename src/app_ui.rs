@@ -24,6 +24,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+mod main_menu;
+
 const RESCAN_EVERY: Duration = Duration::from_secs(10);
 const SEARCH_ID: &str = "note-search";
 
@@ -197,6 +199,11 @@ impl NoteSyncApp {
     }
 
     fn update_folders(&mut self, change: impl FnOnce(&mut AppConfig)) {
+        self.update_config(change);
+        self.rescan();
+    }
+
+    fn update_config(&mut self, change: impl FnOnce(&mut AppConfig)) {
         let saved = {
             let mut cfg = self.config.lock().unwrap();
             change(&mut cfg);
@@ -206,7 +213,6 @@ impl NoteSyncApp {
             Ok(()) => String::new(),
             Err(err) => format!("無法儲存設定：{err}"),
         };
-        self.rescan();
     }
 
     // ---- editor -------------------------------------------------------------
@@ -368,6 +374,7 @@ impl NoteSyncApp {
         let state = BackupState {
             report: report.as_ref(),
             is_running: self.scheduler.is_running(),
+            is_pushing: self.scheduler.is_pushing(),
             is_paused: self.scheduler.is_paused(),
             editor_dirty: self.editor_dirty(),
             last_saved_at: self.last_saved_at,
@@ -398,47 +405,6 @@ impl NoteSyncApp {
             if let Some(detail) = &line.detail {
                 label.on_hover_text(detail);
             }
-        }
-    }
-
-    fn show_main_menu(&mut self, ui: &mut egui::Ui) {
-        let can_back_up =
-            !self.editor_dirty() && !self.scheduler.is_running() && !self.folders().is_empty();
-        ui.menu_button(RichText::new("⋯").size(18.0), |ui| {
-            if ui.add_enabled(can_back_up, egui::Button::new("立即備份")).clicked() {
-                self.scheduler.request_now();
-                ui.close_menu();
-            }
-            let paused = self.scheduler.is_paused();
-            let pause_text = if paused { "繼續自動備份" } else { "暫停自動備份" };
-            if ui.button(pause_text).clicked() {
-                self.scheduler.set_paused(!paused);
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button("加入資料夾…").clicked() {
-                ui.close_menu();
-                self.pick_and_add_folder();
-            }
-            self.show_remove_menu(ui);
-        });
-    }
-
-    fn show_remove_menu(&mut self, ui: &mut egui::Ui) {
-        let folders = self.folders();
-        let mut removed = None;
-        ui.add_enabled_ui(!folders.is_empty(), |ui| {
-            ui.menu_button("移除資料夾", |ui| {
-                for folder in &folders {
-                    if ui.button(folder_label(folder, &folders)).clicked() {
-                        removed = Some(folder.clone());
-                        ui.close_menu();
-                    }
-                }
-            });
-        });
-        if let Some(folder) = removed {
-            self.remove_folder(&folder);
         }
     }
 
@@ -775,6 +741,7 @@ impl eframe::App for NoteSyncApp {
         let waiting = self.scan.is_some()
             || self.extra.is_busy()
             || self.scheduler.is_running()
+            || self.scheduler.is_pushing()
             || self.editor.as_ref().is_some_and(|e| e.is_dirty() && !e.has_conflict);
         let next = if waiting { 200 } else { 1000 };
         ctx.request_repaint_after(Duration::from_millis(next));

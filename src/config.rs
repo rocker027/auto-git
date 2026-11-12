@@ -21,6 +21,11 @@ pub struct AppConfig {
     pub search_limit: usize,
     /// Skip auto-commit when working tree has staged changes.
     pub skip_if_staged: bool,
+    /// Push each folder to its configured upstream after backing it up.
+    /// Off unless the user turns it on; a config written before this field
+    /// existed must still load, or the folder list would be lost.
+    #[serde(default)]
+    pub auto_push: bool,
 }
 
 impl Default for AppConfig {
@@ -33,6 +38,7 @@ impl Default for AppConfig {
             qmd_collection: None,
             search_limit: 10,
             skip_if_staged: true,
+            auto_push: false,
         }
     }
 }
@@ -96,6 +102,23 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.check_interval_secs = 5;
         assert_eq!(cfg.check_interval(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn config_written_before_auto_push_still_loads() {
+        let old = r#"{
+            "folders": ["/notes"],
+            "check_interval_secs": 300,
+            "git_path": "git",
+            "qmd_path": "qmd",
+            "qmd_collection": null,
+            "search_limit": 10,
+            "skip_if_staged": true
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(cfg.folders, vec![PathBuf::from("/notes")]);
+        assert!(!cfg.auto_push, "push stays off until the user turns it on");
+        assert!(!AppConfig::default().auto_push);
     }
 
     #[test]
